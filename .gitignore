@@ -1,0 +1,13 @@
+# backend/.gitignore
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.local
+venv/
+env/
+*.egg-info/
+public/logos/
+public/documentos/
+public/comprobantes/
+.DS_Store
