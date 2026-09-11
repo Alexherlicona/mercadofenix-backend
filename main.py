@@ -23,7 +23,7 @@ app = FastAPI(title="Mercado Fénix 2025")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8000"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8000", "https://mercadofenix-backend.onrender.com", "https://mercadofenix.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
