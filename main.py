@@ -18,6 +18,12 @@ from routes.social import router as social_router
 from routes.descargas import router as descargas_router
 from routes.reportes import router as reportes_router
 from routes.google_auth import router as google_router
+import cloudinary
+cloudinary.config(
+    cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key    = os.getenv("CLOUDINARY_API_KEY"),
+    api_secret = os.getenv("CLOUDINARY_API_SECRET"),
+)
 
 app = FastAPI(title="Mercado Fénix 2025")
 
