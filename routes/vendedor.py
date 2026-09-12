@@ -143,27 +143,55 @@ async def register_vendedor(
     except Exception:
         pass  # columna aún no existe → ignorar
 
-    os.makedirs("public/logos",       exist_ok=True)
-    os.makedirs("public/documentos",  exist_ok=True)
+    os.makedirs("public/documentos", exist_ok=True)
 
-    # ── Guardar logo (opcional) ───────────────────────────────────────────────
+    # ── Subir logo a Cloudinary (opcional) ───────────────────────────────────
     logo_url = None
     if logo and logo.filename:
         if not logo.content_type.startswith("image/"):
             raise HTTPException(400, "El logo debe ser una imagen")
-        ext_logo = logo.filename.split(".")[-1].lower()
-        if ext_logo not in ["jpg", "jpeg", "png", "webp"]:
-            ext_logo = "jpg"
-        path_logo = f"public/logos/{dni}.{ext_logo}"
-        with open(path_logo, "wb") as f:
-            f.write(await logo.read())
-        logo_url = f"/logos/{dni}.{ext_logo}"
+        try:
+            import cloudinary.uploader
+            contenido_logo = await logo.read()
+            resultado = cloudinary.uploader.upload(
+                contenido_logo,
+                folder="mercadofenix/logos",
+                public_id=f"logo_{dni}",
+                overwrite=True,
+                resource_type="image",
+            )
+            logo_url = resultado["secure_url"]
+        except Exception as e:
+            print(f"[Cloudinary] Error subiendo logo: {e}")
+            # Fallback a disco si Cloudinary falla
+            os.makedirs("public/logos", exist_ok=True)
+            ext_logo = logo.filename.split(".")[-1].lower()
+            if ext_logo not in ["jpg", "jpeg", "png", "webp"]: ext_logo = "jpg"
+            path_logo = f"public/logos/{dni}.{ext_logo}"
+            with open(path_logo, "wb") as f:
+                f.write(contenido_logo)
+            logo_url = f"/logos/{dni}.{ext_logo}"
 
-    # ── Guardar documento de identidad ────────────────────────────────────────
-    path_doc = f"public/documentos/{dni}_doc.{ext_doc}"
-    with open(path_doc, "wb") as f:
-        f.write(await documento_identidad.read())
-    documento_url = f"/documentos/{dni}_doc.{ext_doc}"
+    # ── Subir documento de identidad a Cloudinary ─────────────────────────────
+    try:
+        import cloudinary.uploader
+        contenido_doc = await documento_identidad.read()
+        resource_type = "raw" if ext_doc == "pdf" else "image"
+        resultado_doc = cloudinary.uploader.upload(
+            contenido_doc,
+            folder="mercadofenix/documentos",
+            public_id=f"doc_{dni}",
+            overwrite=True,
+            resource_type=resource_type,
+        )
+        documento_url = resultado_doc["secure_url"]
+    except Exception as e:
+        print(f"[Cloudinary] Error subiendo documento: {e}")
+        # Fallback a disco
+        path_doc = f"public/documentos/{dni}_doc.{ext_doc}"
+        with open(path_doc, "wb") as f:
+            f.write(contenido_doc)
+        documento_url = f"/documentos/{dni}_doc.{ext_doc}"
 
     # ── Normalizar campos opcionales ──────────────────────────────────────────
     lat  = latitud  if latitud  is not None else None
@@ -347,17 +375,31 @@ async def actualizar_perfil(
     if logo and logo.filename:
         if not logo.content_type.startswith("image/"):
             raise HTTPException(400, detail="Solo se permiten imágenes")
-        logo_dir = "public/logos"
-        os.makedirs(logo_dir, exist_ok=True)
-        if cv.logo_url:
-            viejo = f"public{cv.logo_url}"
-            if os.path.exists(viejo): os.remove(viejo)
-        ext = logo.filename.split(".")[-1].lower()
-        if ext not in ["jpg", "jpeg", "png", "webp"]: ext = "jpg"
-        path = os.path.join(logo_dir, f"{cv.dni}.{ext}")
-        with open(path, "wb") as f:
-            f.write(await logo.read())
-        cv.logo_url = f"/logos/{cv.dni}.{ext}"
+        contenido_logo = await logo.read()
+        try:
+            import cloudinary.uploader
+            resultado = cloudinary.uploader.upload(
+                contenido_logo,
+                folder="mercadofenix/logos",
+                public_id=f"logo_{cv.dni}",
+                overwrite=True,
+                resource_type="image",
+            )
+            cv.logo_url = resultado["secure_url"]
+        except Exception as e:
+            print(f"[Cloudinary] Error actualizando logo: {e}")
+            # Fallback a disco
+            logo_dir = "public/logos"
+            os.makedirs(logo_dir, exist_ok=True)
+            if cv.logo_url and not cv.logo_url.startswith("http"):
+                viejo = f"public{cv.logo_url}"
+                if os.path.exists(viejo): os.remove(viejo)
+            ext = logo.filename.split(".")[-1].lower()
+            if ext not in ["jpg", "jpeg", "png", "webp"]: ext = "jpg"
+            path = os.path.join(logo_dir, f"{cv.dni}.{ext}")
+            with open(path, "wb") as f:
+                f.write(contenido_logo)
+            cv.logo_url = f"/logos/{cv.dni}.{ext}"
  
     db.commit()
     db.refresh(cv)
