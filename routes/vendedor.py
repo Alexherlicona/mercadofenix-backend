@@ -15,6 +15,56 @@ from datetime import datetime, timedelta
 import os
 from sqlalchemy import func
 
+# ── Helper Cloudinary ─────────────────────────────────────────────────────────
+async def _subir_foto_cloudinary(archivo, public_id: str) -> str:
+    """
+    Sube una foto de producto a Cloudinary.
+    Fallback a disco si Cloudinary no está configurado o falla.
+    """
+    try:
+        import cloudinary.uploader
+        contenido = archivo.file.read()
+        resultado = cloudinary.uploader.upload(
+            contenido,
+            folder="mercadofenix/productos",
+            public_id=public_id,
+            overwrite=True,
+            resource_type="image",
+        )
+        return resultado["secure_url"]
+    except Exception as e:
+        print(f"[Cloudinary] Error subiendo foto {public_id}: {e}")
+        # Fallback a disco
+        archivo.file.seek(0)
+        ext = archivo.filename.rsplit(".", 1)[-1].lower() if "." in archivo.filename else "jpg"
+        if ext not in ["jpg", "jpeg", "png", "webp"]: ext = "jpg"
+        ruta = f"public/uploads/productos/{public_id}.{ext}"
+        os.makedirs(os.path.dirname(ruta), exist_ok=True)
+        with open(ruta, "wb") as f:
+            shutil.copyfileobj(archivo.file, f)
+        return f"/uploads/productos/{public_id}.{ext}"
+
+
+def _eliminar_foto(url: str):
+    """Elimina una foto de Cloudinary o disco según la URL."""
+    if not url:
+        return
+    if url.startswith("http"):
+        try:
+            import cloudinary.uploader
+            partes = url.split("/upload/")
+            if len(partes) == 2:
+                public_id = partes[1].rsplit(".", 1)[0]
+                if "/" in public_id and public_id.split("/")[0].startswith("v"):
+                    public_id = public_id.split("/", 1)[1]
+                cloudinary.uploader.destroy(public_id)
+        except Exception as e:
+            print(f"[Cloudinary] Error eliminando {url}: {e}")
+    else:
+        ruta = f"public{url}" if url.startswith("/") else url
+        if os.path.exists(ruta):
+            os.remove(ruta)
+
 # prefix="/vendedor" + main.py prefix="/api" = /api/vendedor/...
 router = APIRouter(prefix="/vendedor")
 
@@ -143,55 +193,27 @@ async def register_vendedor(
     except Exception:
         pass  # columna aún no existe → ignorar
 
-    os.makedirs("public/documentos", exist_ok=True)
+    os.makedirs("public/logos",       exist_ok=True)
+    os.makedirs("public/documentos",  exist_ok=True)
 
-    # ── Subir logo a Cloudinary (opcional) ───────────────────────────────────
+    # ── Guardar logo (opcional) ───────────────────────────────────────────────
     logo_url = None
     if logo and logo.filename:
         if not logo.content_type.startswith("image/"):
             raise HTTPException(400, "El logo debe ser una imagen")
-        try:
-            import cloudinary.uploader
-            contenido_logo = await logo.read()
-            resultado = cloudinary.uploader.upload(
-                contenido_logo,
-                folder="mercadofenix/logos",
-                public_id=f"logo_{dni}",
-                overwrite=True,
-                resource_type="image",
-            )
-            logo_url = resultado["secure_url"]
-        except Exception as e:
-            print(f"[Cloudinary] Error subiendo logo: {e}")
-            # Fallback a disco si Cloudinary falla
-            os.makedirs("public/logos", exist_ok=True)
-            ext_logo = logo.filename.split(".")[-1].lower()
-            if ext_logo not in ["jpg", "jpeg", "png", "webp"]: ext_logo = "jpg"
-            path_logo = f"public/logos/{dni}.{ext_logo}"
-            with open(path_logo, "wb") as f:
-                f.write(contenido_logo)
-            logo_url = f"/logos/{dni}.{ext_logo}"
+        ext_logo = logo.filename.split(".")[-1].lower()
+        if ext_logo not in ["jpg", "jpeg", "png", "webp"]:
+            ext_logo = "jpg"
+        path_logo = f"public/logos/{dni}.{ext_logo}"
+        with open(path_logo, "wb") as f:
+            f.write(await logo.read())
+        logo_url = f"/logos/{dni}.{ext_logo}"
 
-    # ── Subir documento de identidad a Cloudinary ─────────────────────────────
-    try:
-        import cloudinary.uploader
-        contenido_doc = await documento_identidad.read()
-        resource_type = "raw" if ext_doc == "pdf" else "image"
-        resultado_doc = cloudinary.uploader.upload(
-            contenido_doc,
-            folder="mercadofenix/documentos",
-            public_id=f"doc_{dni}",
-            overwrite=True,
-            resource_type=resource_type,
-        )
-        documento_url = resultado_doc["secure_url"]
-    except Exception as e:
-        print(f"[Cloudinary] Error subiendo documento: {e}")
-        # Fallback a disco
-        path_doc = f"public/documentos/{dni}_doc.{ext_doc}"
-        with open(path_doc, "wb") as f:
-            f.write(contenido_doc)
-        documento_url = f"/documentos/{dni}_doc.{ext_doc}"
+    # ── Guardar documento de identidad ────────────────────────────────────────
+    path_doc = f"public/documentos/{dni}_doc.{ext_doc}"
+    with open(path_doc, "wb") as f:
+        f.write(await documento_identidad.read())
+    documento_url = f"/documentos/{dni}_doc.{ext_doc}"
 
     # ── Normalizar campos opcionales ──────────────────────────────────────────
     lat  = latitud  if latitud  is not None else None
@@ -375,31 +397,17 @@ async def actualizar_perfil(
     if logo and logo.filename:
         if not logo.content_type.startswith("image/"):
             raise HTTPException(400, detail="Solo se permiten imágenes")
-        contenido_logo = await logo.read()
-        try:
-            import cloudinary.uploader
-            resultado = cloudinary.uploader.upload(
-                contenido_logo,
-                folder="mercadofenix/logos",
-                public_id=f"logo_{cv.dni}",
-                overwrite=True,
-                resource_type="image",
-            )
-            cv.logo_url = resultado["secure_url"]
-        except Exception as e:
-            print(f"[Cloudinary] Error actualizando logo: {e}")
-            # Fallback a disco
-            logo_dir = "public/logos"
-            os.makedirs(logo_dir, exist_ok=True)
-            if cv.logo_url and not cv.logo_url.startswith("http"):
-                viejo = f"public{cv.logo_url}"
-                if os.path.exists(viejo): os.remove(viejo)
-            ext = logo.filename.split(".")[-1].lower()
-            if ext not in ["jpg", "jpeg", "png", "webp"]: ext = "jpg"
-            path = os.path.join(logo_dir, f"{cv.dni}.{ext}")
-            with open(path, "wb") as f:
-                f.write(contenido_logo)
-            cv.logo_url = f"/logos/{cv.dni}.{ext}"
+        logo_dir = "public/logos"
+        os.makedirs(logo_dir, exist_ok=True)
+        if cv.logo_url:
+            viejo = f"public{cv.logo_url}"
+            if os.path.exists(viejo): os.remove(viejo)
+        ext = logo.filename.split(".")[-1].lower()
+        if ext not in ["jpg", "jpeg", "png", "webp"]: ext = "jpg"
+        path = os.path.join(logo_dir, f"{cv.dni}.{ext}")
+        with open(path, "wb") as f:
+            f.write(await logo.read())
+        cv.logo_url = f"/logos/{cv.dni}.{ext}"
  
     db.commit()
     db.refresh(cv)
@@ -614,7 +622,7 @@ async def editar_producto(
                 FotoProducto.producto_id == producto.id
             ).first()
             if foto:
-                if os.path.exists(f"public{foto.url}"): os.remove(f"public{foto.url}")
+                _eliminar_foto(foto.url)
                 db.delete(foto)
         except Exception as e:
             print(f"Error eliminando foto {fid_str}: {e}")
@@ -652,13 +660,9 @@ async def editar_producto(
     nuevo_orden = db.query(FotoProducto).filter(FotoProducto.producto_id == producto.id).count()
     for foto_file in form.getlist("fotos"):
         if not hasattr(foto_file, "filename") or not foto_file.filename: continue
-        ext = foto_file.filename.rsplit(".", 1)[-1].lower() if "." in foto_file.filename else "webp"
-        filename = f"{producto.id}_{nuevo_orden}_{int(datetime.now().timestamp())}.{ext}"
-        filepath = f"public/uploads/productos/{filename}"
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "wb") as buf:
-            shutil.copyfileobj(foto_file.file, buf)
-        db.add(FotoProducto(producto_id=producto.id, url=f"/uploads/productos/{filename}", orden=nuevo_orden))
+        public_id = f"{producto.id}_{nuevo_orden}_{int(datetime.now().timestamp())}"
+        url = await _subir_foto_cloudinary(foto_file, public_id)
+        db.add(FotoProducto(producto_id=producto.id, url=url, orden=nuevo_orden))
         nuevo_orden += 1
 
     db.commit()
@@ -679,9 +683,10 @@ async def eliminar_producto(
         raise HTTPException(404, "Producto no encontrado")
 
     for foto in producto.fotos:
-        if os.path.exists(f"public{foto.url}"): os.remove(f"public{foto.url}")
-    if producto.archivo_key and os.path.exists(f"public{producto.archivo_key}"):
-        os.remove(f"public{producto.archivo_key}")
+        _eliminar_foto(foto.url)
+    if producto.archivo_key and not producto.archivo_key.startswith("http"):
+        if os.path.exists(f"public{producto.archivo_key}"):
+            os.remove(f"public{producto.archivo_key}")
 
     db.delete(producto)
     db.commit()
