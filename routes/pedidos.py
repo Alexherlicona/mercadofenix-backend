@@ -1,4 +1,9 @@
 # backend/routes/pedidos.py
+import re
+import time
+from typing import Dict, Optional, Tuple
+
+import requests
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from core.database import get_db
@@ -7,6 +12,7 @@ from models.cliente import Cliente
 from models.pedido import Pedido
 from models.direccion import Direccion
 from models.producto import Producto
+from models.vendedor import Vendedor
 from schemas import PedidoCreate, PedidoOut, PedidoUpdateEstado
 from crud.pedidos import crear_pedidos_por_vendedor, obtener_pedido, obtener_pedidos_cliente, actualizar_estado_pedido
 from typing import List
@@ -22,6 +28,50 @@ def _todos_digitales(items_data: list, db: Session) -> bool:
         if not p or p.tipo != "digital":
             return False
     return True
+
+
+# ── Helper: resolver coordenadas de un enlace de Google Maps ──────────────────
+# Permite incrustar un mapa (iframe) sin necesitar una API key de Google:
+# seguimos el enlace (incluyendo enlaces cortos maps.app.goo.gl) hasta la URL
+# final, que ya trae las coordenadas en el formato .../@lat,lng,zoom/...
+# Se cachea en memoria por 24h para no repetir la petición a Google en cada
+# vista del pedido.
+_COORDS_CACHE: Dict[str, Tuple[float, float, float]] = {}
+_COORDS_CACHE_TTL = 60 * 60 * 24  # 24 horas
+
+_COORD_PATTERNS = [
+    re.compile(r"@(-?\d+\.\d+),(-?\d+\.\d+)"),
+    re.compile(r"[?&]q=(-?\d+\.\d+),(-?\d+\.\d+)"),
+]
+
+
+def _resolver_coordenadas_maps(url: str) -> Optional[Tuple[float, float]]:
+    if not url:
+        return None
+
+    cacheado = _COORDS_CACHE.get(url)
+    if cacheado and (time.time() - cacheado[2]) < _COORDS_CACHE_TTL:
+        return cacheado[0], cacheado[1]
+
+    try:
+        resp = requests.get(
+            url,
+            allow_redirects=True,
+            timeout=5,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; MercadoFenixBot/1.0)"},
+        )
+        destino = resp.url
+        for patron in _COORD_PATTERNS:
+            match = patron.search(destino)
+            if match:
+                lat, lng = float(match.group(1)), float(match.group(2))
+                _COORDS_CACHE[url] = (lat, lng, time.time())
+                return lat, lng
+    except Exception:
+        # Si Google bloquea la petición o el enlace no es válido, simplemente
+        # no se incrusta el mapa y el frontend cae de vuelta al enlace simple.
+        pass
+    return None
 
 
 # ==================== CREAR PEDIDO ====================
@@ -163,6 +213,25 @@ async def obtener_detalle_pedido(
                 "telefono": d.telefono_contacto,
             }
 
+    # ── Datos del vendedor: necesarios para mostrar el mapa de la tienda en
+    # el chat cuando el tipo de entrega es "recoger en tienda". Solo se
+    # resuelven las coordenadas cuando realmente hacen falta (tipo "tienda"),
+    # para no golpear a Google en pedidos a domicilio u oficina Fénix. ───────
+    vendedor_info = None
+    if pedido.vendedor_id:
+        v = db.query(Vendedor).filter(Vendedor.dni == pedido.vendedor_id).first()
+        if v:
+            vendedor_info = {
+                "nombre_tienda":   v.nombre_tienda,
+                "google_maps_url": v.google_maps_url,
+                "google_maps_lat": None,
+                "google_maps_lng": None,
+            }
+            if pedido.tipo_entrega == "tienda" and v.google_maps_url:
+                coords = _resolver_coordenadas_maps(v.google_maps_url)
+                if coords:
+                    vendedor_info["google_maps_lat"], vendedor_info["google_maps_lng"] = coords
+
     return {
         "id":                  pedido.id,
         "estado":              pedido.estado,
@@ -176,6 +245,7 @@ async def obtener_detalle_pedido(
         "descarga_habilitada": getattr(pedido, "descarga_habilitada", False),
         "descarga_token":      pedido.descarga_token if getattr(pedido, "descarga_habilitada", False) else None,
         "direccion":           pedido.direccion_alternativa or direccion_info or "No especificada",
+        "vendedor":            vendedor_info,
         "nota_cliente":        pedido.nota_cliente,
         "nota_vendedor":       pedido.nota_vendedor,
         "fecha_pedido":        pedido.fecha_pedido,
