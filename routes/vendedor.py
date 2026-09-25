@@ -3,6 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Form, File, UploadFile, Request
 from crud.producto import crear_producto
 from sqlalchemy.orm import Session, joinedload
+import logging
 from sqlalchemy import text
 from core.database import get_db
 from models.vendedor import Vendedor
@@ -14,6 +15,10 @@ import shutil
 from datetime import datetime, timedelta
 import os
 from sqlalchemy import func
+import cloudinary
+import cloudinary.uploader
+
+logger = logging.getLogger(__name__)
 
 # ── Helper Cloudinary ─────────────────────────────────────────────────────────
 async def _subir_foto_cloudinary(archivo, public_id: str) -> str:
@@ -132,6 +137,9 @@ def _get_ip(request: Request) -> str:
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
+REQUIERE_DOCUMENTO_IDENTIDAD = False
+ 
+ 
 @router.post("/register")           # → POST /api/vendedor/register
 async def register_vendedor(
     dni: str = Form(...),
@@ -152,7 +160,7 @@ async def register_vendedor(
     google_maps_url: Optional[str] = Form(None),
     # Archivos
     logo: Optional[UploadFile] = File(None),
-    documento_identidad: UploadFile = File(...),    # OBLIGATORIO
+    documento_identidad: Optional[UploadFile] = File(None),   # ← ya no es obligatorio
     db: Session = Depends(get_db)
 ):
     # ── Validaciones básicas ──────────────────────────────────────────────────
@@ -166,20 +174,22 @@ async def register_vendedor(
         raise HTTPException(400, "Correo electrónico inválido")
     if len(password) < 8:
         raise HTTPException(400, "La contraseña debe tener al menos 8 caracteres")
-
-    # ── Documento de identidad obligatorio ───────────────────────────────────
-    if not documento_identidad or not documento_identidad.filename:
+ 
+    # ── Documento de identidad (opcional por ahora) ──────────────────────────
+    ext_doc = None
+    if documento_identidad and documento_identidad.filename:
+        ext_doc = documento_identidad.filename.split(".")[-1].lower()
+        if ext_doc not in ["jpg", "jpeg", "png", "webp", "pdf"]:
+            raise HTTPException(400, "El documento debe ser JPG, PNG, WEBP o PDF")
+    elif REQUIERE_DOCUMENTO_IDENTIDAD:
         raise HTTPException(400, "Debes subir una foto de tu documento de identidad")
-    ext_doc = documento_identidad.filename.split(".")[-1].lower()
-    if ext_doc not in ["jpg", "jpeg", "png", "webp", "pdf"]:
-        raise HTTPException(400, "El documento debe ser JPG, PNG, WEBP o PDF")
-
+ 
     # ── Unicidad ─────────────────────────────────────────────────────────────
     if db.query(Vendedor).filter(Vendedor.dni == dni).first():
         raise HTTPException(400, "Este DNI ya está registrado")
     if db.query(Vendedor).filter(Vendedor.telefono == telefono).first():
         raise HTTPException(400, "Este teléfono ya está registrado")
-
+ 
     # Verificar email usando text() para columna que puede no existir en el modelo viejo
     try:
         existe_email = db.execute(
@@ -192,34 +202,43 @@ async def register_vendedor(
         raise
     except Exception:
         pass  # columna aún no existe → ignorar
-
-    os.makedirs("public/logos",       exist_ok=True)
-    os.makedirs("public/documentos",  exist_ok=True)
-
-    # ── Guardar logo (opcional) ───────────────────────────────────────────────
+ 
+    # ── Guardar logo (opcional) → Cloudinary ─────────────────────────────────
     logo_url = None
     if logo and logo.filename:
         if not logo.content_type.startswith("image/"):
             raise HTTPException(400, "El logo debe ser una imagen")
-        ext_logo = logo.filename.split(".")[-1].lower()
-        if ext_logo not in ["jpg", "jpeg", "png", "webp"]:
-            ext_logo = "jpg"
-        path_logo = f"public/logos/{dni}.{ext_logo}"
-        with open(path_logo, "wb") as f:
-            f.write(await logo.read())
-        logo_url = f"/logos/{dni}.{ext_logo}"
-
-    # ── Guardar documento de identidad ────────────────────────────────────────
-    path_doc = f"public/documentos/{dni}_doc.{ext_doc}"
-    with open(path_doc, "wb") as f:
-        f.write(await documento_identidad.read())
-    documento_url = f"/documentos/{dni}_doc.{ext_doc}"
-
+        try:
+            contenido_logo = await logo.read()
+            resultado = cloudinary.uploader.upload(
+                contenido_logo,
+                folder="mercadofenix/logos",
+                public_id=dni,             # un logo por vendedor, se sobreescribe si vuelve a subir
+                overwrite=True,
+                resource_type="image",
+                transformation=[{"width": 500, "height": 500, "crop": "limit"}],
+            )
+            logo_url = resultado.get("secure_url")
+        except Exception as e:
+            # Si Cloudinary falla (credenciales, red, límite de plan, etc.) el
+            # registro no debe romperse por el logo — solo queda sin logo.
+            logger.error(f"Error subiendo logo a Cloudinary para dni={dni}: {e}")
+            logo_url = None
+ 
+    # ── Guardar documento de identidad (opcional, se sigue guardando local) ──
+    documento_url = None
+    if documento_identidad and documento_identidad.filename and ext_doc:
+        os.makedirs("public/documentos", exist_ok=True)
+        path_doc = f"public/documentos/{dni}_doc.{ext_doc}"
+        with open(path_doc, "wb") as f:
+            f.write(await documento_identidad.read())
+        documento_url = f"/documentos/{dni}_doc.{ext_doc}"
+ 
     # ── Normalizar campos opcionales ──────────────────────────────────────────
     lat  = latitud  if latitud  is not None else None
     lng  = longitud if longitud is not None else None
     maps = google_maps_url.strip() if google_maps_url else None
-
+ 
     # ── Crear vendedor ────────────────────────────────────────────────────────
     nuevo = Vendedor(
         dni=dni, rtn=rtn, propietario=propietario, nombre_tienda=nombre_tienda,
@@ -230,7 +249,7 @@ async def register_vendedor(
     )
     db.add(nuevo)
     db.flush()
-
+ 
     # Asignar campos nuevos con UPDATE para mayor compatibilidad
     try:
         db.execute(text(
@@ -239,11 +258,9 @@ async def register_vendedor(
         ), {"e": email.lower(), "d": documento_url, "lat": lat, "lng": lng, "maps": maps, "dni": dni})
     except Exception:
         pass  # si la migración SQL no se corrió aún, el registro igual funciona
-
+ 
     db.commit()
-    return {"msg": "Solicitud enviada con éxito. El administrador revisará tu documento y aprobará tu tienda."}
-
-
+    return {"msg": "Solicitud enviada con éxito. El administrador revisará tu información y aprobará tu tienda."}
 @router.post("/login")              # → POST /api/vendedor/login
 async def login_vendedor(
     request: Request,
