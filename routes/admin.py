@@ -274,9 +274,9 @@ async def extender_plan(dni: str, data: dict, db: Session = Depends(get_db), adm
 
     # Mapear plan al CHECK constraint (basico|pro|premium|prueba)
     plan_map = {
-        "basico": "basico", "l300": "basico", "300": "basico",
-        "pro":    "pro",    "l500": "pro",    "500": "pro",
-        "premium":"premium","l800": "premium","800": "premium",
+        "basico": "basico", "1000": "basico", "100": "basico",
+        "pro":    "pro",    "1300": "pro",    "300": "pro",
+        "premium":"premium","l500": "premium","500": "premium",
         "prueba": "prueba",
     }
     plan = plan_map.get(plan.lower(), "basico")
@@ -594,17 +594,17 @@ async def get_planes():
             "descripcion": "Para comenzar. 3 meses sin costo.",
         },
         "basico": {
-            "nombre": "Básico",  "precio": 300, "duracion": "mensual",
+            "nombre": "Básico",  "precio": 100, "duracion": "mensual",
             "max_productos": 30, "max_destacados": 5,
             "descripcion": "Para tiendas pequeñas que quieren crecer.",
         },
         "pro": {
-            "nombre": "Pro",     "precio": 500, "duracion": "mensual",
+            "nombre": "Pro",     "precio": 300, "duracion": "mensual",
             "max_productos": 150, "max_destacados": 15,
             "descripcion": "Para tiendas en crecimiento con más visibilidad.",
         },
         "premium": {
-            "nombre": "Premium", "precio": 800, "duracion": "mensual",
+            "nombre": "Premium", "precio": 500, "duracion": "mensual",
             "max_productos": 999999, "max_destacados": 999999,
             "descripcion": "Sin límites. Todo incluido.",
         },
