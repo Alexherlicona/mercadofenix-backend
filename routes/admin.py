@@ -189,11 +189,11 @@ async def aprobar_vendedor(data: dict, db: Session = Depends(get_db), admin=Depe
     v.solicitud_pendiente = False
     v.fecha_aprobacion  = datetime.utcnow()
     v.aprobado_por      = admin.usuario
-    # 1 mes gratis
-    v.fecha_expiracion  = datetime.utcnow() + relativedelta(months=1)
+    # 3 meses gratis
+    v.fecha_expiracion  = datetime.utcnow() + relativedelta(months=3)
     v.plan              = "prueba"
     db.commit()
-    return {"msg": "Vendedor aprobado. 1 mes gratis activado."}
+    return {"msg": "Vendedor aprobado. 3 meses gratis activado."}
 
 
 @router.post("/admin/rechazar-vendedor")
