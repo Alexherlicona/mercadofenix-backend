@@ -1,9 +1,4 @@
 # backend/routes/pedidos.py
-import re
-import time
-from typing import Dict, Optional, Tuple
-
-import requests
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from core.database import get_db
@@ -17,13 +12,6 @@ from schemas import PedidoCreate, PedidoOut, PedidoUpdateEstado
 from crud.pedidos import crear_pedidos_por_vendedor, obtener_pedido, obtener_pedidos_cliente, actualizar_estado_pedido
 from typing import List
 from datetime import datetime, timedelta
-import asyncio
-from routes.notificaciones import crear_y_enviar_notificacion
-from notifications.email_service import (
-    html_nuevo_pedido_vendedor,
-    html_estado_pedido_cliente,
-    ESTADO_LABEL,
-)
 
 router = APIRouter(prefix="/api/pedidos", tags=["pedidos"])
 
@@ -35,50 +23,6 @@ def _todos_digitales(items_data: list, db: Session) -> bool:
         if not p or p.tipo != "digital":
             return False
     return True
-
-
-# ── Helper: resolver coordenadas de un enlace de Google Maps ──────────────────
-# Permite incrustar un mapa (iframe) sin necesitar una API key de Google:
-# seguimos el enlace (incluyendo enlaces cortos maps.app.goo.gl) hasta la URL
-# final, que ya trae las coordenadas en el formato .../@lat,lng,zoom/...
-# Se cachea en memoria por 24h para no repetir la petición a Google en cada
-# vista del pedido.
-_COORDS_CACHE: Dict[str, Tuple[float, float, float]] = {}
-_COORDS_CACHE_TTL = 60 * 60 * 24  # 24 horas
-
-_COORD_PATTERNS = [
-    re.compile(r"@(-?\d+\.\d+),(-?\d+\.\d+)"),
-    re.compile(r"[?&]q=(-?\d+\.\d+),(-?\d+\.\d+)"),
-]
-
-
-def _resolver_coordenadas_maps(url: str) -> Optional[Tuple[float, float]]:
-    if not url:
-        return None
-
-    cacheado = _COORDS_CACHE.get(url)
-    if cacheado and (time.time() - cacheado[2]) < _COORDS_CACHE_TTL:
-        return cacheado[0], cacheado[1]
-
-    try:
-        resp = requests.get(
-            url,
-            allow_redirects=True,
-            timeout=5,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; MercadoFenixBot/1.0)"},
-        )
-        destino = resp.url
-        for patron in _COORD_PATTERNS:
-            match = patron.search(destino)
-            if match:
-                lat, lng = float(match.group(1)), float(match.group(2))
-                _COORDS_CACHE[url] = (lat, lng, time.time())
-                return lat, lng
-    except Exception:
-        # Si Google bloquea la petición o el enlace no es válido, simplemente
-        # no se incrusta el mapa y el frontend cae de vuelta al enlace simple.
-        pass
-    return None
 
 
 # ==================== CREAR PEDIDO ====================
@@ -141,64 +85,21 @@ async def crear_nuevo_pedido(
             nota_cliente=pedido_data.nota_cliente,
             es_digital=es_digital,
         )
-    
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al crear pedido: {str(e)}")
-    
+
     total_general = sum(float(p.total) for p in pedidos)
-    vendedores_notificados: set = set()
-    for pedido in pedidos:
-        vid = pedido.vendedor_id
-        if not vid or vid in vendedores_notificados:
-            continue
-        vendedores_notificados.add(vid)
-        try:
-            vendedor_obj = db.query(Vendedor).filter(Vendedor.dni == vid).first()
-            if not vendedor_obj:
-                continue
- 
-            items_resumen = ", ".join(
-                f"{it.nombre_producto} x{it.cantidad}"
-                for it in pedido.items
-            )[:120]
- 
-            email_html = html_nuevo_pedido_vendedor(
-                nombre_tienda  = vendedor_obj.nombre_tienda,
-                pedido_id      = pedido.id,
-                cliente_nombre = f"{current_user.nombres} {current_user.apellidos}",
-                cliente_tel    = current_user.telefono or "—",
-                total          = float(pedido.total),
-                items_resumen  = items_resumen,
-                tipo_entrega   = pedido.tipo_entrega or "—",
-                metodo_pago    = pedido.metodo_pago or "—",
-            )
- 
-            asyncio.create_task(crear_y_enviar_notificacion(
-                db            = db,
-                usuario_tipo  = "vendedor",
-                usuario_id    = vid,
-                titulo        = f"🛍️ Nuevo pedido #{pedido.id}",
-                cuerpo        = f"{current_user.nombres} realizó un pedido por L{float(pedido.total):,.2f}",
-                url           = "/vendedor/dashboard/pedidos",
-                tipo          = "pedido",
-                referencia_id = pedido.id,
-                email_to      = getattr(vendedor_obj, "email", None),
-                email_asunto  = f"Nuevo pedido #{pedido.id} — {vendedor_obj.nombre_tienda}",
-                email_html    = email_html,
-            ))
-        except Exception as e:
-            print(f"[NOTIF] Error preparando notificación nuevo pedido: {e}")
- 
+
     return {
-        "mensaje":     "Pedido creado exitosamente",
-        "pedido_id":   pedidos[0].id,
-        "pedidos_ids": [p.id for p in pedidos],
-        "num_pedidos": len(pedidos),
-        "total":       total_general,
-        "estado":      "pendiente",
-        "es_digital":  es_digital,
+        "mensaje":      "Pedido creado exitosamente",
+        "pedido_id":    pedidos[0].id,
+        "pedidos_ids":  [p.id for p in pedidos],
+        "num_pedidos":  len(pedidos),
+        "total":        total_general,
+        "estado":       "pendiente",
+        "es_digital":   es_digital,
     }
 
 
@@ -263,10 +164,8 @@ async def obtener_detalle_pedido(
                 "telefono": d.telefono_contacto,
             }
 
-    # ── Datos del vendedor: necesarios para mostrar el mapa de la tienda en
-    # el chat cuando el tipo de entrega es "recoger en tienda". Solo se
-    # resuelven las coordenadas cuando realmente hacen falta (tipo "tienda"),
-    # para no golpear a Google en pedidos a domicilio u oficina Fénix. ───────
+    # ── Datos del vendedor: necesarios para mostrar la ubicación de la
+    # tienda en el chat cuando el tipo de entrega es "recoger en tienda" ──────
     vendedor_info = None
     if pedido.vendedor_id:
         v = db.query(Vendedor).filter(Vendedor.dni == pedido.vendedor_id).first()
@@ -274,13 +173,7 @@ async def obtener_detalle_pedido(
             vendedor_info = {
                 "nombre_tienda":   v.nombre_tienda,
                 "google_maps_url": v.google_maps_url,
-                "google_maps_lat": None,
-                "google_maps_lng": None,
             }
-            if pedido.tipo_entrega == "tienda" and v.google_maps_url:
-                coords = _resolver_coordenadas_maps(v.google_maps_url)
-                if coords:
-                    vendedor_info["google_maps_lat"], vendedor_info["google_maps_lng"] = coords
 
     return {
         "id":                  pedido.id,
@@ -411,46 +304,13 @@ async def actualizar_estado(
         raise HTTPException(status_code=404, detail="Pedido no encontrado")
     if pedido.vendedor_id != current_vendedor.dni:
         raise HTTPException(status_code=403, detail="No tienes permiso")
- 
+
     estados_validos = ["pendiente","confirmado","en_preparacion","en_camino","entregado","cancelado"]
     if update_data.estado not in estados_validos:
-        raise HTTPException(status_code=400, detail="Estado inválido")
- 
+        raise HTTPException(status_code=400, detail=f"Estado inválido")
+
     pedido = actualizar_estado_pedido(db, pedido_id, update_data.estado, update_data.nota_vendedor)
- 
-    # ── Notificar al cliente ──────────────────────────────────────────────────
-    try:
-        cliente_obj = db.query(Cliente).filter(Cliente.id == pedido.cliente_id).first()
-        if cliente_obj:
-            label = ESTADO_LABEL.get(update_data.estado, update_data.estado)
- 
-            email_html = html_estado_pedido_cliente(
-                cliente_nombre = f"{cliente_obj.nombres} {cliente_obj.apellidos}",
-                pedido_id      = pedido_id,
-                nuevo_estado   = update_data.estado,
-                nombre_tienda  = current_vendedor.nombre_tienda,
-                total          = float(pedido.total),
-                nota_vendedor  = update_data.nota_vendedor,
-            )
- 
-            asyncio.create_task(crear_y_enviar_notificacion(
-                db            = db,
-                usuario_tipo  = "cliente",
-                usuario_id    = str(cliente_obj.id),
-                titulo        = f"📦 Pedido #{pedido_id}: {label}",
-                cuerpo        = f"Tu pedido en {current_vendedor.nombre_tienda} está: {label}",
-                url           = "/fenix/mi-cuenta/mis-pedidos",
-                tipo          = "estado",
-                referencia_id = pedido_id,
-                email_to      = getattr(cliente_obj, "email", None),
-                email_asunto  = f"Tu pedido #{pedido_id} — {label}",
-                email_html    = email_html,
-            ))
-    except Exception as e:
-        print(f"[NOTIF] Error preparando notificación de estado: {e}")
- 
     return {"mensaje": "Estado actualizado", "pedido_id": pedido.id, "nuevo_estado": pedido.estado}
-    
 
 
 # ==================== BORRADO ====================
@@ -488,13 +348,3 @@ async def limpiar_pedidos_entregados(db: Session = Depends(get_db)):
         p.activo = False
     db.commit()
     return {"mensaje": f"{total} pedidos archivados automáticamente"}
-
-def _pedido_resumen(p: Pedido) -> dict:
-    return {
-        "id":           p.id,
-        "estado":       p.estado,
-        "total":        float(p.total),
-        "tipo_entrega": p.tipo_entrega,
-        "metodo_pago":  p.metodo_pago,
-        "fecha_pedido": p.fecha_pedido.isoformat() if p.fecha_pedido else None,
-    }
