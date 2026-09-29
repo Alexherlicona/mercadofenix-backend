@@ -2,7 +2,6 @@
 import json
 import os
 import shutil
-import asyncio
 from datetime import datetime
 from typing import Dict, List, Set
 
@@ -18,18 +17,16 @@ from models.vendedor import Vendedor
 from jose import jwt, JWTError
 from core.security import SECRET_KEY, ALGORITHM
 
-# ── Notificaciones ─────────────────────────────────────────────────────────────
-from routes.notificaciones import crear_y_enviar_notificacion
-
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 UPLOAD_COMPROBANTES = "public/uploads/comprobantes"
 os.makedirs(UPLOAD_COMPROBANTES, exist_ok=True)
 
 
-# ─── GESTOR DE CONEXIONES WEBSOCKET ───────────────────────────────────────────
+# ─── GESTOR DE CONEXIONES WEBSOCKET ──────────────────────────────────────────
 class ConnectionManager:
     def __init__(self):
+        # sala_id → set de WebSockets activos
         self.active: Dict[int, Set[WebSocket]] = {}
 
     async def connect(self, sala_id: int, ws: WebSocket):
@@ -41,6 +38,7 @@ class ConnectionManager:
             self.active[sala_id].discard(ws)
 
     async def broadcast(self, sala_id: int, data: dict):
+        """Enviar mensaje a todos los conectados en la sala."""
         muertos = set()
         for ws in self.active.get(sala_id, set()):
             try:
@@ -50,96 +48,46 @@ class ConnectionManager:
         for ws in muertos:
             self.active[sala_id].discard(ws)
 
-    def hay_conectados(self, sala_id: int) -> bool:
-        """True si hay alguien conectado por WS en esta sala."""
-        return bool(self.active.get(sala_id))
-
 
 manager = ConnectionManager()
 
 
 # ─── HELPER: autenticar desde token en WS ────────────────────────────────────
 def autenticar_ws(token: str, db: Session):
+    """Retorna (tipo, id) donde tipo es 'cliente' o 'vendedor'."""
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        sub  = payload.get("sub")
+        sub = payload.get("sub")
         role = payload.get("role")
         if not sub:
             return None, None
+
         if role == "vendedor":
             v = db.query(Vendedor).filter(Vendedor.dni == sub).first()
             return ("vendedor", v.dni) if v else (None, None)
         else:
+            # cliente — sub es teléfono
             c = db.query(Cliente).filter(Cliente.telefono == sub).first()
             return ("cliente", str(c.id)) if c else (None, None)
     except JWTError:
         return None, None
 
 
-# ─── HELPER: enviar notificación de chat ─────────────────────────────────────
-async def _notificar_mensaje(
-    db: Session,
-    sala: ChatSala,
-    remitente_tipo: str,
-    contenido: str,
-):
-    """
-    Notifica al OTRO participante de la sala (no al que envía).
-    Solo envía notificación si el destinatario NO está conectado por WS,
-    para no duplicar alertas cuando ambos tienen el chat abierto.
-    """
-    try:
-        preview = contenido[:80] + ("..." if len(contenido) > 80 else "")
-
-        if remitente_tipo == "cliente":
-            # Notificar al vendedor
-            vendedor = db.query(Vendedor).filter(Vendedor.dni == sala.vendedor_id).first()
-            if vendedor:
-                await crear_y_enviar_notificacion(
-                    db           = db,
-                    usuario_tipo = "vendedor",
-                    usuario_id   = sala.vendedor_id,
-                    titulo       = "💬 Nuevo mensaje de un cliente",
-                    cuerpo       = preview,
-                    url          = "/vendedor/dashboard/pedidos",
-                    tipo         = "chat",
-                    referencia_id= sala.pedido_id,
-                    # Sin email para mensajes de chat — evita spam
-                )
-        else:
-            # Notificar al cliente
-            cliente = db.query(Cliente).filter(Cliente.id == sala.cliente_id).first()
-            vendedor = db.query(Vendedor).filter(Vendedor.dni == sala.vendedor_id).first()
-            nombre_tienda = vendedor.nombre_tienda if vendedor else "La tienda"
-            if cliente:
-                await crear_y_enviar_notificacion(
-                    db           = db,
-                    usuario_tipo = "cliente",
-                    usuario_id   = str(sala.cliente_id),
-                    titulo       = f"💬 {nombre_tienda} te respondió",
-                    cuerpo       = preview,
-                    url          = "/fenix/mi-cuenta/mis-pedidos",
-                    tipo         = "chat",
-                    referencia_id= sala.pedido_id,
-                )
-    except Exception as e:
-        print(f"[NOTIF CHAT] Error: {e}")
-
-
-# ─── CREAR O RECUPERAR SALA ────────────────────────────────────────────────────
+# ─── CREAR O RECUPERAR SALA ───────────────────────────────────────────────────
 @router.post("/sala/{pedido_id}")
 async def obtener_o_crear_sala(
     pedido_id: int,
     current_user: Cliente = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    """El cliente abre el chat de un pedido → crea la sala si no existe."""
     pedido = db.query(Pedido).filter(
         Pedido.id == pedido_id,
         Pedido.cliente_id == current_user.id
     ).first()
     if not pedido:
         raise HTTPException(404, "Pedido no encontrado")
-
+    # Si el pedido no tiene vendedor aún, intentar inferirlo del primer item
     if not pedido.vendedor_id:
         from models.pedido import PedidoItem
         from models.producto import Producto
@@ -155,9 +103,9 @@ async def obtener_o_crear_sala(
     sala = db.query(ChatSala).filter(ChatSala.pedido_id == pedido_id).first()
     if not sala:
         sala = ChatSala(
-            pedido_id  = pedido_id,
-            cliente_id = current_user.id,
-            vendedor_id= pedido.vendedor_id,
+            pedido_id=pedido_id,
+            cliente_id=current_user.id,
+            vendedor_id=pedido.vendedor_id,
         )
         db.add(sala)
         db.commit()
@@ -172,6 +120,7 @@ async def obtener_sala_vendedor(
     current_vendedor: Vendedor = Depends(get_current_vendedor),
     db: Session = Depends(get_db)
 ):
+    """El vendedor abre el chat de un pedido."""
     pedido = db.query(Pedido).filter(
         Pedido.id == pedido_id,
         Pedido.vendedor_id == current_vendedor.dni
@@ -182,9 +131,9 @@ async def obtener_sala_vendedor(
     sala = db.query(ChatSala).filter(ChatSala.pedido_id == pedido_id).first()
     if not sala:
         sala = ChatSala(
-            pedido_id  = pedido_id,
-            cliente_id = pedido.cliente_id,
-            vendedor_id= current_vendedor.dni,
+            pedido_id=pedido_id,
+            cliente_id=pedido.cliente_id,
+            vendedor_id=current_vendedor.dni,
         )
         db.add(sala)
         db.commit()
@@ -207,6 +156,7 @@ async def get_mensajes(
     if not sala:
         raise HTTPException(404, "Sala no encontrada")
 
+    # Marcar mensajes del vendedor como leídos
     db.query(ChatMensaje).filter(
         ChatMensaje.sala_id == sala_id,
         ChatMensaje.remitente_tipo == "vendedor",
@@ -248,7 +198,7 @@ async def get_mensajes_vendedor(
     return {"mensajes": [_msg_to_dict(m) for m in mensajes]}
 
 
-# ─── ENVIAR MENSAJE HTTP (fallback REST) ──────────────────────────────────────
+# ─── ENVIAR MENSAJE POR HTTP (fallback cuando el WS no está listo) ────────────
 @router.post("/sala/vendedor/{sala_id}/mensaje")
 async def enviar_mensaje_vendedor(
     sala_id: int,
@@ -256,6 +206,10 @@ async def enviar_mensaje_vendedor(
     current_vendedor: Vendedor = Depends(get_current_vendedor),
     db: Session = Depends(get_db)
 ):
+    """
+    Permite al vendedor enviar un mensaje por REST cuando el WebSocket
+    aún no está en estado OPEN (p.ej. al autorizar descarga recién abierto el chat).
+    """
     sala = db.query(ChatSala).filter(
         ChatSala.id == sala_id,
         ChatSala.vendedor_id == current_vendedor.dni
@@ -268,27 +222,25 @@ async def enviar_mensaje_vendedor(
         raise HTTPException(400, "El mensaje no puede estar vacío")
 
     msg = ChatMensaje(
-        sala_id        = sala_id,
-        remitente_tipo = "vendedor",
-        remitente_id   = current_vendedor.dni,
-        contenido      = contenido,
-        leido_vendedor = True,
-        leido_cliente  = False,
+        sala_id=sala_id,
+        remitente_tipo="vendedor",
+        remitente_id=current_vendedor.dni,
+        contenido=contenido,
+        leido_vendedor=True,
+        leido_cliente=False,
     )
     db.add(msg)
     sala.ultimo_mensaje_en = datetime.utcnow()
     db.commit()
     db.refresh(msg)
 
-    await manager.broadcast(sala_id, {"tipo": "mensaje", **_msg_to_dict(msg)})
-
-    # Notificar al cliente si no está en el chat
-    asyncio.create_task(_notificar_mensaje(db, sala, "vendedor", contenido))
+    # Notificar por WS a quien esté conectado en la sala
+    await manager.broadcast(sala_id, {
+        "tipo": "mensaje",
+        **_msg_to_dict(msg)
+    })
 
     return {"mensaje": _msg_to_dict(msg)}
-
-
-# ─── SUBIR COMPROBANTE ────────────────────────────────────────────────────────
 @router.post("/sala/{sala_id}/comprobante")
 async def subir_comprobante(
     sala_id: int,
@@ -296,6 +248,7 @@ async def subir_comprobante(
     current_user: Cliente = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    """El cliente sube su comprobante de pago como mensaje especial."""
     sala = db.query(ChatSala).filter(
         ChatSala.id == sala_id,
         ChatSala.cliente_id == current_user.id
@@ -303,94 +256,139 @@ async def subir_comprobante(
     if not sala:
         raise HTTPException(404, "Sala no encontrada")
 
-    ext = archivo.filename.rsplit(".", 1)[-1].lower() if "." in archivo.filename else "jpg"
-    if ext not in ["jpg", "jpeg", "png", "webp", "pdf"]:
-        raise HTTPException(400, "Formato no permitido")
+    ext = archivo.filename.rsplit(".", 1)[-1].lower()
+    if ext not in ["jpg", "jpeg", "png", "pdf", "webp"]:
+        raise HTTPException(400, "Solo se permiten imágenes o PDF")
 
-    filename  = f"{sala_id}_{int(datetime.utcnow().timestamp())}.{ext}"
-    filepath  = os.path.join(UPLOAD_COMPROBANTES, filename)
-    contenido = await archivo.read()
-    with open(filepath, "wb") as f:
-        f.write(contenido)
+    filename = f"comprobante_{sala_id}_{int(datetime.utcnow().timestamp())}.{ext}"
+    path = os.path.join(UPLOAD_COMPROBANTES, filename)
+    with open(path, "wb") as f:
+        shutil.copyfileobj(archivo.file, f)
 
-    url = f"/uploads/comprobantes/{filename}"
+    archivo_url = f"/uploads/comprobantes/{filename}"
 
     msg = ChatMensaje(
-        sala_id        = sala_id,
-        remitente_tipo = "cliente",
-        remitente_id   = str(current_user.id),
-        contenido      = "📎 Comprobante de pago",
-        es_comprobante = True,
-        archivo_url    = url,
-        leido_cliente  = True,
-        leido_vendedor = False,
+        sala_id=sala_id,
+        remitente_tipo="cliente",
+        remitente_id=str(current_user.id),
+        contenido="📎 Comprobante de pago enviado",
+        es_comprobante=True,
+        archivo_url=archivo_url,
+        leido_vendedor=False,
+        leido_cliente=True,
     )
     db.add(msg)
     sala.ultimo_mensaje_en = datetime.utcnow()
     db.commit()
     db.refresh(msg)
 
-    await manager.broadcast(sala_id, {"tipo": "mensaje", **_msg_to_dict(msg)})
+    # Notificar via WS a todos en la sala
+    await manager.broadcast(sala_id, {
+        "tipo": "mensaje",
+        **_msg_to_dict(msg)
+    })
 
-    # Notificar al vendedor
-    asyncio.create_task(_notificar_mensaje(db, sala, "cliente", "📎 Comprobante de pago"))
-
-    return {"mensaje": _msg_to_dict(msg), "url": url}
+    return {"archivo_url": archivo_url, "mensaje_id": msg.id}
 
 
-# ─── SALAS DEL VENDEDOR ───────────────────────────────────────────────────────
+# ─── LISTA DE SALAS DEL VENDEDOR ─────────────────────────────────────────────
 @router.get("/vendedor/salas")
 async def salas_vendedor(
     current_vendedor: Vendedor = Depends(get_current_vendedor),
     db: Session = Depends(get_db)
 ):
-    salas = db.query(ChatSala).filter(
+    """Lista de todas las conversaciones del vendedor, ordenadas por actividad."""
+    salas = db.query(ChatSala).options(
+        joinedload(ChatSala.cliente),
+        joinedload(ChatSala.pedido),
+    ).filter(
         ChatSala.vendedor_id == current_vendedor.dni
     ).order_by(ChatSala.ultimo_mensaje_en.desc().nullslast()).all()
 
-    resultado = []
+    # Excluir pedidos archivados por el vendedor (usando text() para columna nueva)
+    from sqlalchemy import text as sql_text
+    try:
+        archivados_rows = db.execute(sql_text(
+            "SELECT id FROM pedidos WHERE vendedor_id = :dni AND archivado_vendedor = true"
+        ), {"dni": current_vendedor.dni}).fetchall()
+        archivados = {r[0] for r in archivados_rows}
+    except Exception:
+        archivados = set()  # si la migración no se corrió aún, no filtrar
+    salas = [s for s in salas if s.pedido_id not in archivados]
+
+    result = []
     for sala in salas:
-        pedido  = db.query(Pedido).filter(Pedido.id == sala.pedido_id).first()
-        cliente = db.query(Cliente).filter(Cliente.id == sala.cliente_id).first()
         no_leidos = db.query(ChatMensaje).filter(
             ChatMensaje.sala_id == sala.id,
             ChatMensaje.remitente_tipo == "cliente",
             ChatMensaje.leido_vendedor == False
         ).count()
 
-        resultado.append({
-            "sala_id":        sala.id,
-            "pedido_id":      sala.pedido_id,
-            "estado_pedido":  pedido.estado if pedido else "—",
-            "total_pedido":   float(pedido.total) if pedido else 0,
-            "cliente_nombre": f"{cliente.nombres} {cliente.apellidos}" if cliente else "Cliente",
-            "cliente_tel":    cliente.telefono if cliente else "",
-            "no_leidos":      no_leidos,
-            "ultimo_mensaje": sala.ultimo_mensaje_en.isoformat() if sala.ultimo_mensaje_en else None,
+        ultimo = db.query(ChatMensaje).filter(
+            ChatMensaje.sala_id == sala.id
+        ).order_by(ChatMensaje.enviado_en.desc()).first()
+
+        result.append({
+            "sala_id": sala.id,
+            "pedido_id": sala.pedido_id,
+            "cliente_id": sala.cliente_id,
+            "cliente_nombre": f"{sala.cliente.nombres} {sala.cliente.apellidos}",
+            "cliente_telefono": sala.cliente.telefono,
+            "pedido_estado": sala.pedido.estado if sala.pedido else "desconocido",
+            "pedido_total": float(sala.pedido.total) if sala.pedido else 0,
+            "es_digital": getattr(sala.pedido, "es_digital", False) if sala.pedido else False,
+            "no_leidos": no_leidos,
+            "ultimo_mensaje": ultimo.contenido if ultimo else None,
+            "ultimo_mensaje_en": ultimo.enviado_en.isoformat() if ultimo else None,
         })
-    return {"salas": resultado}
+
+    return {"salas": result}
 
 
+
+# ─── ARCHIVAR PEDIDO (ocultar del historial del vendedor) ────────────────────
 @router.delete("/vendedor/pedidos/{pedido_id}")
 async def archivar_pedido_vendedor(
     pedido_id: int,
     current_vendedor: Vendedor = Depends(get_current_vendedor),
     db: Session = Depends(get_db)
 ):
+    """
+    Archiva un pedido del historial del vendedor.
+    Solo aplica a pedidos entregados o cancelados.
+    El pedido NO se elimina de la BD — solo se oculta para el vendedor.
+    """
     pedido = db.query(Pedido).filter(
         Pedido.id == pedido_id,
         Pedido.vendedor_id == current_vendedor.dni
     ).first()
     if not pedido:
         raise HTTPException(404, "Pedido no encontrado")
-    pedido.activo = False
-    db.commit()
-    return {"mensaje": "Pedido archivado"}
+    if pedido.estado not in ("entregado", "cancelado"):
+        raise HTTPException(400, "Solo se pueden archivar pedidos entregados o cancelados")
+
+    from sqlalchemy import text
+    try:
+        db.execute(
+            text("UPDATE pedidos SET archivado_vendedor = true WHERE id = :id AND vendedor_id = :dni"),
+            {"id": pedido_id, "dni": current_vendedor.dni}
+        )
+        db.commit()
+    except Exception:
+        # Si la columna no existe aún (migración pendiente), hacer soft-delete local
+        db.rollback()
+        raise HTTPException(500, "Ejecuta la migración fix_archivado_vendedor.sql primero")
+
+    return {"msg": "Pedido archivado del historial"}
 
 
 # ─── WEBSOCKET ────────────────────────────────────────────────────────────────
 @router.websocket("/ws/{sala_id}")
 async def websocket_chat(websocket: WebSocket, sala_id: int, token: str):
+    """
+    Conexión WebSocket para chat en tiempo real.
+    URL: ws://localhost:8000/api/chat/ws/{sala_id}?token=<jwt>
+    """
     db = SessionLocal()
     try:
         tipo, remitente_id = autenticar_ws(token, db)
@@ -398,6 +396,7 @@ async def websocket_chat(websocket: WebSocket, sala_id: int, token: str):
             await websocket.close(code=4001)
             return
 
+        # Verificar que pertenece a esta sala
         if tipo == "cliente":
             sala = db.query(ChatSala).filter(
                 ChatSala.id == sala_id,
@@ -425,30 +424,26 @@ async def websocket_chat(websocket: WebSocket, sala_id: int, token: str):
                         continue
 
                     msg = ChatMensaje(
-                        sala_id        = sala_id,
-                        remitente_tipo = tipo,
-                        remitente_id   = remitente_id,
-                        contenido      = contenido,
-                        leido_cliente  = (tipo == "cliente"),
-                        leido_vendedor = (tipo == "vendedor"),
+                        sala_id=sala_id,
+                        remitente_tipo=tipo,
+                        remitente_id=remitente_id,
+                        contenido=contenido,
+                        leido_cliente=(tipo == "cliente"),
+                        leido_vendedor=(tipo == "vendedor"),
                     )
                     db.add(msg)
                     sala.ultimo_mensaje_en = datetime.utcnow()
                     db.commit()
                     db.refresh(msg)
 
-                    # Broadcast por WS
+                    # Broadcast a toda la sala
                     await manager.broadcast(sala_id, {
                         "tipo": "mensaje",
                         **_msg_to_dict(msg)
                     })
 
-                    # Push + BD — solo si el otro no está conectado por WS
-                    asyncio.create_task(
-                        _notificar_mensaje(db, sala, tipo, contenido)
-                    )
-
                 elif data.get("tipo") == "typing":
+                    # Notificar que el otro está escribiendo
                     await manager.broadcast(sala_id, {
                         "tipo": "typing",
                         "remitente_tipo": tipo,
@@ -464,14 +459,14 @@ async def websocket_chat(websocket: WebSocket, sala_id: int, token: str):
 # ─── HELPER ───────────────────────────────────────────────────────────────────
 def _msg_to_dict(m: ChatMensaje) -> dict:
     return {
-        "id":              m.id,
-        "sala_id":         m.sala_id,
-        "remitente_tipo":  m.remitente_tipo,
-        "remitente_id":    m.remitente_id,
-        "contenido":       m.contenido,
-        "es_comprobante":  m.es_comprobante,
-        "archivo_url":     m.archivo_url,
-        "leido_cliente":   m.leido_cliente,
-        "leido_vendedor":  m.leido_vendedor,
-        "enviado_en":      m.enviado_en.isoformat() if m.enviado_en else None,
+        "id": m.id,
+        "sala_id": m.sala_id,
+        "remitente_tipo": m.remitente_tipo,
+        "remitente_id": m.remitente_id,
+        "contenido": m.contenido,
+        "es_comprobante": m.es_comprobante,
+        "archivo_url": m.archivo_url,
+        "leido_cliente": m.leido_cliente,
+        "leido_vendedor": m.leido_vendedor,
+        "enviado_en": m.enviado_en.isoformat() if m.enviado_en else None,
     }
