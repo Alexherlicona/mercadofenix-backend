@@ -13,6 +13,9 @@ from crud.pedidos import crear_pedidos_por_vendedor, obtener_pedido, obtener_ped
 from typing import List
 from datetime import datetime, timedelta
 
+# ── Notificaciones (in-app + push + email) ────────────────────────────────────
+from routes.notificaciones import notificar_nuevo_pedido_vendedor, notificar_cambio_estado_cliente
+
 router = APIRouter(prefix="/api/pedidos", tags=["pedidos"])
 
 
@@ -91,6 +94,18 @@ async def crear_nuevo_pedido(
         raise HTTPException(status_code=500, detail=f"Error al crear pedido: {str(e)}")
 
     total_general = sum(float(p.total) for p in pedidos)
+
+    # ── Notificar a cada vendedor involucrado (un pedido por vendedor) ────────
+    # Best-effort: si una notificación falla, no debe tumbar la respuesta al
+    # cliente — el pedido ya se creó y se guardó correctamente en BD.
+    for p in pedidos:
+        try:
+            if p.vendedor_id:
+                vendedor = db.query(Vendedor).filter(Vendedor.dni == p.vendedor_id).first()
+                if vendedor:
+                    await notificar_nuevo_pedido_vendedor(db, p, vendedor, current_user)
+        except Exception as e:
+            print(f"[NOTIF] Error notificando nuevo pedido #{p.id} al vendedor: {e}")
 
     return {
         "mensaje":      "Pedido creado exitosamente",
@@ -310,6 +325,15 @@ async def actualizar_estado(
         raise HTTPException(status_code=400, detail=f"Estado inválido")
 
     pedido = actualizar_estado_pedido(db, pedido_id, update_data.estado, update_data.nota_vendedor)
+
+    # ── Notificar al cliente el cambio de estado (in-app + push + email) ─────
+    try:
+        cliente = db.query(Cliente).filter(Cliente.id == pedido.cliente_id).first()
+        if cliente:
+            await notificar_cambio_estado_cliente(db, pedido, cliente, current_vendedor.nombre_tienda)
+    except Exception as e:
+        print(f"[NOTIF] Error notificando cambio de estado del pedido #{pedido.id}: {e}")
+
     return {"mensaje": "Estado actualizado", "pedido_id": pedido.id, "nuevo_estado": pedido.estado}
 
 
