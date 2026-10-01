@@ -1,32 +1,40 @@
 # backend/notifications/email_service.py
 #
-# Envío de correos transaccionales usando smtplib estándar (sin dependencias extra).
+# Envío de correos transaccionales usando la API REST de Mailjet (v3.1).
+# Se eligió la API sobre SMTP porque: (1) da códigos de error claros por
+# mensaje, (2) permite reintentar solo lo que falló, (3) mejor entregabilidad
+# y estadísticas desde el panel de Mailjet.
+#
 # Variables de entorno requeridas en .env:
-#   SMTP_HOST=smtp.gmail.com
-#   SMTP_PORT=587
-#   SMTP_USER=notificaciones@mercadofenix.com
-#   SMTP_PASSWORD=tu_app_password          ← En Gmail usar "App Password", no la contraseña normal
+#   MAILJET_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+#   MAILJET_API_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+#   MAILJET_FROM_EMAIL=notificaciones@tudominio.com   ← debe estar verificado en Mailjet
 #   EMAIL_FROM_NAME=Mercado Fénix
 #   FRONTEND_URL=https://mercadofenix.com
 #
-# Para Gmail: Activar verificación en 2 pasos → Generar App Password en
-# https://myaccount.google.com/apppasswords
+# Cómo conseguir las llaves: https://app.mailjet.com/account/apikeys
+# El plan gratuito de Mailjet da 200 emails/día y no requiere tarjeta.
+#
+# IMPORTANTE: MAILJET_FROM_EMAIL debe ser un remitente verificado en tu
+# cuenta de Mailjet (Account Settings → Sender addresses) o los envíos
+# fallarán con 401/403.
 
 import os
-import smtplib
-import ssl
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from typing import Optional
+import time
+import requests
+from typing import Optional, List, Dict
 import asyncio
 from datetime import datetime
 
-SMTP_HOST      = os.getenv("SMTP_HOST",      "smtp.gmail.com")
-SMTP_PORT      = int(os.getenv("SMTP_PORT",  "587"))
-SMTP_USER      = os.getenv("SMTP_USER",      "")
-SMTP_PASSWORD  = os.getenv("SMTP_PASSWORD",  "")
-FROM_NAME      = os.getenv("EMAIL_FROM_NAME","Mercado Fénix")
-FRONTEND_URL   = os.getenv("FRONTEND_URL",   "http://localhost:3000")
+MAILJET_API_KEY    = os.getenv("MAILJET_API_KEY", "")
+MAILJET_API_SECRET = os.getenv("MAILJET_API_SECRET", "")
+MAILJET_FROM_EMAIL  = os.getenv("MAILJET_FROM_EMAIL", "notificaciones@mercadofenix.com")
+FROM_NAME      = os.getenv("EMAIL_FROM_NAME", "Mercado Fénix")
+FRONTEND_URL   = os.getenv("FRONTEND_URL",    "http://localhost:3000")
+
+MAILJET_SEND_URL      = "https://api.mailjet.com/v3.1/send"
+MAX_REINTENTOS        = 3   # ante error transitorio (red, 429, 5xx)
+BACKOFF_BASE_SEGUNDOS = 2   # 2s, 4s, 6s...
 
 
 # ── Paleta de colores por estado ─────────────────────────────────────────────
@@ -136,13 +144,11 @@ def html_nuevo_pedido_vendedor(
     <h2 style="margin:0 0 4px;color:#111827;font-size:22px;font-weight:900;">¡Nuevo pedido recibido! 🛍️</h2>
     <p style="margin:0 0 24px;color:#6b7280;font-size:14px;">Tienda: <strong>{nombre_tienda}</strong></p>
 
-    <!-- Badge pedido -->
     <div style="background:#fff7ed;border:1.5px solid #fed7aa;border-radius:12px;padding:16px 20px;margin-bottom:24px;">
       <p style="margin:0;color:#ea580c;font-size:13px;font-weight:700;">PEDIDO #{pedido_id}</p>
       <p style="margin:4px 0 0;color:#9a3412;font-size:28px;font-weight:900;">L{total:,.2f}</p>
     </div>
 
-    <!-- Detalle -->
     <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
       {_item_fila("Cliente",       cliente_nombre)}
       {_item_fila("Teléfono",      cliente_tel)}
@@ -188,7 +194,6 @@ def html_estado_pedido_cliente(
     </h2>
     <p style="margin:0 0 24px;color:#6b7280;font-size:14px;">Hola, <strong>{cliente_nombre}</strong></p>
 
-    <!-- Badge estado -->
     <div style="background:{color}18;border:2px solid {color}40;border-radius:12px;padding:16px 20px;margin-bottom:20px;text-align:center;">
       <p style="margin:0;color:{color};font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:1px;">
         Pedido #{pedido_id} · {nombre_tienda}
@@ -209,31 +214,157 @@ def html_estado_pedido_cliente(
     return _base_html(f"Pedido #{pedido_id}: {label} — Mercado Fénix", cuerpo)
 
 
-# ── Función de envío (síncrona, se llama desde asyncio.to_thread) ─────────────
-def _enviar_sync(destinatario: str, asunto: str, html: str):
-    """Envío SMTP con TLS. Lanza excepción si falla — capturar en el caller."""
-    if not SMTP_USER or not SMTP_PASSWORD:
-        print(f"[EMAIL] Credenciales SMTP no configuradas. Asunto: {asunto} → {destinatario}")
-        return
+# ── Template: Nuevo producto (según preferencias) → Cliente ──────────────────
+def html_nuevo_producto_cliente(
+    cliente_nombre:  str,
+    nombre_producto: str,
+    nombre_tienda:   str,
+    precio:          float,
+    categoria:       str,
+    producto_id:     str,
+    foto_url:        Optional[str] = None,
+) -> str:
+    imagen_bloque = (
+        f'<img src="{foto_url}" alt="{nombre_producto}" '
+        f'style="width:100%;max-width:280px;border-radius:12px;margin:0 auto 16px;display:block;">'
+        if foto_url else ""
+    )
+    cuerpo = f"""
+    <h2 style="margin:0 0 4px;color:#111827;font-size:22px;font-weight:900;">✨ Algo nuevo para ti</h2>
+    <p style="margin:0 0 20px;color:#6b7280;font-size:14px;">
+      Hola, <strong>{cliente_nombre}</strong> — vimos que te interesa <strong>{categoria}</strong>
+    </p>
+    {imagen_bloque}
+    <div style="background:#fff7ed;border:1.5px solid #fed7aa;border-radius:12px;padding:16px 20px;margin-bottom:8px;text-align:center;">
+      <p style="margin:0;color:#111827;font-size:16px;font-weight:800;">{nombre_producto}</p>
+      <p style="margin:6px 0 0;color:#ea580c;font-size:22px;font-weight:900;">L{precio:,.2f}</p>
+      <p style="margin:4px 0 0;color:#9ca3af;font-size:12px;">{nombre_tienda}</p>
+    </div>
+    {_btn("Ver producto", f"{FRONTEND_URL}/fenix/producto/{producto_id}")}
+    <p style="margin:20px 0 0;color:#9ca3af;font-size:11px;text-align:center;">
+      Te avisamos porque has comprado productos similares antes en Mercado Fénix.
+    </p>
+    """
+    return _base_html(f"Nuevo en {categoria}: {nombre_producto}", cuerpo)
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = asunto
-    msg["From"]    = f"{FROM_NAME} <{SMTP_USER}>"
-    msg["To"]      = destinatario
-    msg.attach(MIMEText(html, "html", "utf-8"))
 
-    ctx = ssl.create_default_context()
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-        s.ehlo()
-        s.starttls(context=ctx)
-        s.login(SMTP_USER, SMTP_PASSWORD)
-        s.sendmail(SMTP_USER, destinatario, msg.as_string())
-    print(f"[EMAIL] ✓ Enviado a {destinatario} | {asunto}")
+# ── Template: Promoción de una tienda → Cliente ───────────────────────────────
+def html_promocion_cliente(
+    cliente_nombre: str,
+    titulo:         str,
+    mensaje:        str,
+    nombre_tienda:  str,
+    producto_id:    Optional[str] = None,
+) -> str:
+    boton = (
+        _btn("Ver oferta", f"{FRONTEND_URL}/fenix/producto/{producto_id}")
+        if producto_id else
+        _btn("Ver tienda", f"{FRONTEND_URL}/fenix/productos")
+    )
+    cuerpo = f"""
+    <h2 style="margin:0 0 4px;color:#111827;font-size:22px;font-weight:900;">🔥 {titulo}</h2>
+    <p style="margin:0 0 20px;color:#6b7280;font-size:14px;">
+      Hola, <strong>{cliente_nombre}</strong> — de parte de <strong>{nombre_tienda}</strong>
+    </p>
+    <p style="color:#374151;font-size:14px;line-height:1.65;">{mensaje}</p>
+    {boton}
+    <p style="margin:20px 0 0;color:#9ca3af;font-size:11px;text-align:center;">
+      Recibes esto porque compraste antes en {nombre_tienda} a través de Mercado Fénix.
+    </p>
+    """
+    return _base_html(f"{titulo} — {nombre_tienda}", cuerpo)
 
 
-async def enviar_email(destinatario: str, asunto: str, html: str):
+# ── Template: Sugerencias de productos según historial → Cliente ─────────────
+def html_sugerencia_cliente(
+    cliente_nombre: str,
+    categoria:      str,
+    productos:      List[Dict],   # [{"nombre": str, "precio": float}, ...]
+) -> str:
+    filas = "".join(
+        f'<tr><td style="padding:10px 0;border-bottom:1px solid #f3f4f6;color:#111827;'
+        f'font-size:14px;font-weight:600;">{p["nombre"]}</td>'
+        f'<td style="padding:10px 0;border-bottom:1px solid #f3f4f6;color:#ea580c;'
+        f'font-size:14px;font-weight:800;text-align:right;">L{p["precio"]:,.2f}</td></tr>'
+        for p in productos
+    )
+    cuerpo = f"""
+    <h2 style="margin:0 0 4px;color:#111827;font-size:22px;font-weight:900;">💡 Elegido para ti</h2>
+    <p style="margin:0 0 20px;color:#6b7280;font-size:14px;">
+      Hola, <strong>{cliente_nombre}</strong> — esto podría gustarte en <strong>{categoria}</strong>
+    </p>
+    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-bottom:8px;">{filas}</table>
+    {_btn("Ver más", f"{FRONTEND_URL}/fenix/productos?categoria={categoria}")}
+    <p style="margin:20px 0 0;color:#9ca3af;font-size:11px;text-align:center;">
+      Basado en tu historial de compras en Mercado Fénix.
+    </p>
+    """
+    return _base_html(f"Sugerencias en {categoria} — Mercado Fénix", cuerpo)
+
+
+# ── Función de envío (síncrona; se llama desde asyncio.to_thread) ────────────
+def _enviar_sync(destinatario: str, asunto: str, html: str) -> bool:
+    """
+    Envía un correo vía la API REST de Mailjet (v3.1).
+    - Reintenta ante errores transitorios (timeouts, 429, 5xx) con backoff.
+    - NO reintenta ante errores permanentes (4xx que no sea 429: credenciales
+      inválidas, remitente no verificado, destinatario mal formado, etc.) —
+      reintentar eso solo desperdicia tiempo, el resultado sería el mismo.
+    - Nunca lanza excepción: devuelve True/False. El llamador decide qué
+      hacer (aquí solo se loguea; la notificación en la app ya quedó guardada
+      en BD sin importar si el correo falla).
+    """
+    if not MAILJET_API_KEY or not MAILJET_API_SECRET:
+        print(f"[EMAIL] Credenciales de Mailjet no configuradas. Asunto: {asunto} → {destinatario}")
+        return False
+
+    payload = {
+        "Messages": [{
+            "From": {"Email": MAILJET_FROM_EMAIL, "Name": FROM_NAME},
+            "To":   [{"Email": destinatario}],
+            "Subject":  asunto,
+            "HTMLPart": html,
+        }]
+    }
+
+    ultimo_error = None
+    for intento in range(1, MAX_REINTENTOS + 1):
+        try:
+            resp = requests.post(
+                MAILJET_SEND_URL,
+                auth=(MAILJET_API_KEY, MAILJET_API_SECRET),
+                json=payload,
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                print(f"[EMAIL] ✓ Enviado a {destinatario} | {asunto}")
+                return True
+
+            if resp.status_code == 429 or resp.status_code >= 500:
+                # Rate limit o error del servidor de Mailjet → vale la pena reintentar
+                ultimo_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            else:
+                # Error permanente (400/401/403 por ejemplo) → no reintentar
+                print(f"[EMAIL] ✗ Mailjet rechazó el envío a {destinatario}: "
+                      f"HTTP {resp.status_code} — {resp.text[:200]}")
+                return False
+
+        except requests.RequestException as e:
+            ultimo_error = str(e)
+
+        if intento < MAX_REINTENTOS:
+            time.sleep(BACKOFF_BASE_SEGUNDOS * intento)  # 2s, 4s...
+
+    print(f"[EMAIL] ✗ Falló el envío a {destinatario} tras {MAX_REINTENTOS} intentos: {ultimo_error}")
+    return False
+
+
+async def enviar_email(destinatario: str, asunto: str, html: str) -> bool:
     """Wrapper async — no bloquea el event loop de FastAPI."""
+    if not destinatario:
+        return False
     try:
-        await asyncio.to_thread(_enviar_sync, destinatario, asunto, html)
+        return await asyncio.to_thread(_enviar_sync, destinatario, asunto, html)
     except Exception as e:
-        print(f"[EMAIL] ✗ Error enviando a {destinatario}: {e}")
+        print(f"[EMAIL] ✗ Error inesperado enviando a {destinatario}: {e}")
+        return False
