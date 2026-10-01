@@ -17,6 +17,9 @@ from models.vendedor import Vendedor
 from jose import jwt, JWTError
 from core.security import SECRET_KEY, ALGORITHM
 
+# ── Notificaciones (in-app + push) para mensajes de chat ──────────────────────
+from routes.notificaciones import notificar_nuevo_mensaje_chat
+
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 UPLOAD_COMPROBANTES = "public/uploads/comprobantes"
@@ -47,6 +50,10 @@ class ConnectionManager:
                 muertos.add(ws)
         for ws in muertos:
             self.active[sala_id].discard(ws)
+
+    def conectados_en(self, sala_id: int) -> int:
+        """Cuántos sockets hay conectados ahora mismo en esta sala."""
+        return len(self.active.get(sala_id, set()))
 
 
 manager = ConnectionManager()
@@ -240,7 +247,16 @@ async def enviar_mensaje_vendedor(
         **_msg_to_dict(msg)
     })
 
+    # Notificar al cliente (in-app + push) — este endpoint es precisamente el
+    # fallback para cuando el WS no está disponible, así que siempre avisamos.
+    try:
+        await notificar_nuevo_mensaje_chat(db, sala, "vendedor", contenido)
+    except Exception as e:
+        print(f"[NOTIF] Error notificando mensaje de chat (sala {sala_id}): {e}")
+
     return {"mensaje": _msg_to_dict(msg)}
+
+
 @router.post("/sala/{sala_id}/comprobante")
 async def subir_comprobante(
     sala_id: int,
@@ -287,6 +303,13 @@ async def subir_comprobante(
         "tipo": "mensaje",
         **_msg_to_dict(msg)
     })
+
+    # Notificar al vendedor: un comprobante siempre merece aviso inmediato,
+    # es lo que suele destrabar la confirmación de un pedido.
+    try:
+        await notificar_nuevo_mensaje_chat(db, sala, "cliente", "📎 El cliente envió un comprobante de pago")
+    except Exception as e:
+        print(f"[NOTIF] Error notificando comprobante (sala {sala_id}): {e}")
 
     return {"archivo_url": archivo_url, "mensaje_id": msg.id}
 
@@ -343,7 +366,6 @@ async def salas_vendedor(
         })
 
     return {"salas": result}
-
 
 
 # ─── ARCHIVAR PEDIDO (ocultar del historial del vendedor) ────────────────────
@@ -441,6 +463,16 @@ async def websocket_chat(websocket: WebSocket, sala_id: int, token: str):
                         "tipo": "mensaje",
                         **_msg_to_dict(msg)
                     })
+
+                    # Notificar (in-app + push) a la otra parte, PERO solo si
+                    # no hay ya 2 sockets conectados en la sala — si ambos
+                    # están con el chat abierto en ese momento, ya lo están
+                    # viendo en vivo y una notificación extra sería spam.
+                    try:
+                        if manager.conectados_en(sala_id) < 2:
+                            await notificar_nuevo_mensaje_chat(db, sala, tipo, contenido)
+                    except Exception as e:
+                        print(f"[NOTIF] Error notificando mensaje de chat WS (sala {sala_id}): {e}")
 
                 elif data.get("tipo") == "typing":
                     # Notificar que el otro está escribiendo
