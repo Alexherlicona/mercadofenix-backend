@@ -555,6 +555,16 @@ async def publicar_producto(
 
     prod = crear_producto(db=db, vendedor_id=vendedor.dni, datos=datos, fotos=fotos,
                           archivo_digital=archivo, portada_digital=portada_digital)
+
+    # ── Notificar a clientes interesados en esta categoría (best-effort) ─────
+    # Va DESPUÉS de crear el producto (ya existe `prod`) y ANTES del return.
+    # Si falla, no debe romper la respuesta: el producto ya se publicó bien.
+    try:
+        from routes.notificaciones import notificar_nuevo_producto_interesados
+        await notificar_nuevo_producto_interesados(db, prod, vendedor)
+    except Exception as e:
+        logger.error(f"Error notificando nuevo producto: {e}")
+
     return {"mensaje": "Producto publicado con éxito!", "id": str(prod.id)}
 
 
@@ -645,6 +655,10 @@ async def editar_producto(
             print(f"Error eliminando foto {fid_str}: {e}")
     db.flush()
 
+    # ── Guardamos el descuento ANTES de sobreescribirlo, para poder
+    # comparar después si subió (= nueva promoción) o bajó/se mantuvo ──────
+    descuento_anterior = producto.porcentaje_descuento or 0
+
     # 2. Actualizar campos
     producto.nombre               = form.get("nombre",      producto.nombre)
     producto.categoria            = form.get("categoria",   producto.categoria)
@@ -683,6 +697,18 @@ async def editar_producto(
         nuevo_orden += 1
 
     db.commit()
+
+    # ── Notificar promoción si el descuento es NUEVO o MAYOR que antes ───────
+    # (si bajó, se quitó, o quedó igual, no es una "promoción nueva" y no
+    # avisamos — evita spam cada vez que el vendedor edita el producto).
+    nuevo_descuento = producto.porcentaje_descuento or 0
+    if nuevo_descuento > 0 and nuevo_descuento > descuento_anterior:
+        try:
+            from routes.notificaciones import notificar_promocion_producto
+            await notificar_promocion_producto(db, producto, vendedor, nuevo_descuento)
+        except Exception as e:
+            logger.error(f"Error notificando promoción del producto {producto.id}: {e}")
+
     return {"mensaje": "Producto actualizado con éxito"}
 
 
