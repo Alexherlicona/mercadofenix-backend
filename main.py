@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from scheduler import iniciar_scheduler
+from notifications.scheduler import start_scheduler
 import os
 from routes.admin import router as admin_router
 from routes.vendedor import router as vendedor_router
@@ -19,6 +20,7 @@ from routes.descargas import router as descargas_router
 from routes.reportes import router as reportes_router
 from routes.google_auth import router as google_router
 import cloudinary
+from routes.notificaciones import router as notificaciones_router
 cloudinary.config(
     cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME"),
     api_key    = os.getenv("CLOUDINARY_API_KEY"),
@@ -65,6 +67,7 @@ app.include_router(chat_router)
 app.include_router(social_router)
 app.include_router(descargas_router)
 app.include_router(google_router, prefix="/api")
+app.include_router(notificaciones_router)
 @app.get("/")
 async def root():
     return {"message": "Mercado Fénix API - PEDIDOS IMPLEMENTADOS ✅ - 2025 🔥"}
@@ -75,7 +78,10 @@ vendedores_db = {}
 @app.on_event("startup")
 async def startup_event():
     iniciar_scheduler()
-
+    
+@app.on_event("startup")
+async def begin_event():
+    start_scheduler
 
 @app.post("/api/facturas/generar")
 async def generar_factura(
