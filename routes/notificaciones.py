@@ -31,23 +31,26 @@
 #       cuerpo          TEXT NOT NULL,
 #       url             VARCHAR(500) DEFAULT '/',
 #       leida           BOOLEAN DEFAULT false,
-#       tipo            VARCHAR(50) DEFAULT 'info',   -- 'pedido'|'estado'|'chat'|'info'|'promocion'|'sugerencia'|'promocion_enviada'
-#       referencia_id   INTEGER,                      -- pedido_id relacionado
+#       tipo            VARCHAR(50) DEFAULT 'info',
+#       referencia_id   INTEGER,
 #       creado_en       TIMESTAMPTZ DEFAULT NOW()
 #   );
 #   CREATE INDEX ON notificaciones(usuario_tipo, usuario_id, leida);
-#   CREATE INDEX ON notificaciones(usuario_tipo, usuario_id, tipo, creado_en);  -- para los rate-limits de abajo
-# ─────────────────────────────────────────────────
+#   CREATE INDEX ON notificaciones(usuario_tipo, usuario_id, tipo, creado_en);
 #
-# NOTA sobre las consultas de "clientes interesados en una categoría": usan
-# los modelos ORM (Pedido, PedidoItem, Producto) y sus relaciones ya
-# definidas en el proyecto, no nombres de tabla a mano — así no dependen de
-# cómo se llamen las tablas reales en Postgres.
+#   -- Preferencia de correo promocional (opt-out). Si la columna no existe
+#   -- todavía, el código asume "true" por defecto — no rompe nada mientras
+#   -- corres esta migración:
+#   ALTER TABLE clientes ADD COLUMN IF NOT EXISTS recibir_promociones BOOLEAN DEFAULT true;
+# ─────────────────────────────────────────────────
 
 import os
 import json
+import hmac
+import hashlib
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text, func
 from pydantic import BaseModel
@@ -55,12 +58,14 @@ from typing import Optional, List
 
 from core.database import get_db
 from core.auth import get_current_user, get_current_vendedor
+from core.security import SECRET_KEY
 from models.cliente import Cliente
 
 router = APIRouter(prefix="/api/notificaciones", tags=["notificaciones"])
 
 VAPID_PUBLIC_KEY = os.getenv("VAPID_PUBLIC_KEY", "")
-CRON_SECRET      = os.getenv("CRON_SECRET", "")   # para disparar el job de sugerencias desde un cron externo
+CRON_SECRET      = os.getenv("CRON_SECRET", "")
+API_PUBLIC_URL   = os.getenv("API_PUBLIC_URL", "http://localhost:8000")  # URL pública del backend, para el link de unsubscribe
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -197,22 +202,25 @@ async def enviar_promocion(
         if not cliente:
             continue
         try:
-            html = html_promocion_cliente(
-                cliente_nombre=cliente.nombres, titulo=body.titulo, mensaje=body.mensaje,
-                nombre_tienda=current_vendedor.nombre_tienda, producto_id=body.producto_id,
-            )
+            email_to = cliente.email if _acepta_promociones(db, cid) else None
+            html = None
+            if email_to:
+                html = html_promocion_cliente(
+                    cliente_nombre=cliente.nombres, titulo=body.titulo, mensaje=body.mensaje,
+                    nombre_tienda=current_vendedor.nombre_tienda, producto_id=body.producto_id,
+                    unsubscribe_url=_url_unsubscribe(cid),
+                )
             url = f"/fenix/producto/{body.producto_id}" if body.producto_id else "/fenix/productos"
             await crear_y_enviar_notificacion(
                 db, "cliente", cid,
                 titulo=body.titulo, cuerpo=body.mensaje, url=url, tipo="promocion",
-                email_to=cliente.email, email_asunto=f"🔥 {body.titulo} — {current_vendedor.nombre_tienda}",
-                email_html=html,
+                email_to=email_to, email_asunto=f"🔥 {body.titulo} — {current_vendedor.nombre_tienda}",
+                email_html=html, email_list_unsubscribe=_url_unsubscribe(cid) if email_to else None,
             )
             enviados += 1
         except Exception as e:
             print(f"[PROMOCION] Error notificando a cliente {cid}: {e}")
 
-    # Marca de rate-limit + registro/auditoría visible para el propio vendedor
     try:
         db.execute(text("""
             INSERT INTO notificaciones (usuario_tipo, usuario_id, titulo, cuerpo, tipo)
@@ -229,25 +237,72 @@ async def enviar_promocion(
 # ── Disparar manualmente el job de sugerencias (para cron externo) ───────────
 @router.post("/admin/generar-sugerencias")
 async def trigger_generar_sugerencias(request: Request, db: Session = Depends(get_db)):
-    """
-    Pensado para ser llamado por un cron externo (cron-job.org, GitHub
-    Actions, Render Cron Jobs, etc.) una vez al día, en vez de o además del
-    scheduler in-process (ver notifications/scheduler.py). Protegido con un
-    secreto simple por header:
-        X-Cron-Secret: <CRON_SECRET del .env>
-    """
     if not CRON_SECRET or request.headers.get("X-Cron-Secret") != CRON_SECRET:
         raise HTTPException(403, "No autorizado")
     enviados = await generar_sugerencias_preferencias(db)
     return {"ok": True, "sugerencias_enviadas": enviados}
 
 
+# ── Darse de baja de correos promocionales (link público, sin login) ─────────
+@router.get("/unsubscribe/{cliente_id}", response_class=HTMLResponse)
+def unsubscribe_promociones(cliente_id: int, token: str, db: Session = Depends(get_db)):
+    """
+    Enlace de un clic desde el correo (y vía el header List-Unsubscribe).
+    No requiere sesión iniciada — se valida con un token firmado (HMAC) en
+    vez de pedir login, porque el usuario puede estar dándose de baja desde
+    cualquier dispositivo/cliente de correo.
+    """
+    if not hmac.compare_digest(token, _token_unsubscribe(cliente_id)):
+        raise HTTPException(403, "Enlace inválido o vencido")
+
+    try:
+        db.execute(text("UPDATE clientes SET recibir_promociones = false WHERE id = :id"), {"id": cliente_id})
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[UNSUBSCRIBE] Error actualizando preferencia: {e}")
+        return HTMLResponse(
+            "<html><body style='font-family:sans-serif;text-align:center;padding:60px 20px;'>"
+            "<h2>No pudimos procesar tu solicitud</h2>"
+            "<p>Intenta de nuevo más tarde o contáctanos.</p></body></html>",
+            status_code=500,
+        )
+
+    return HTMLResponse("""
+        <html><body style="font-family:sans-serif;text-align:center;padding:60px 20px;color:#111827;">
+          <h2>Listo, te diste de baja ✅</h2>
+          <p style="color:#6b7280;">Ya no recibirás promociones ni sugerencias de productos por correo.</p>
+          <p style="color:#6b7280;">Seguirás recibiendo avisos de tus pedidos activos.</p>
+        </body></html>
+    """)
+
+
+# ── Helpers internos: token de unsubscribe y preferencia del cliente ─────────
+def _token_unsubscribe(cliente_id: int) -> str:
+    return hmac.new(SECRET_KEY.encode(), str(cliente_id).encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def _url_unsubscribe(cliente_id) -> str:
+    cid = int(cliente_id)
+    return f"{API_PUBLIC_URL}/api/notificaciones/unsubscribe/{cid}?token={_token_unsubscribe(cid)}"
+
+
+def _acepta_promociones(db: Session, cliente_id) -> bool:
+    """True por defecto — incluso si la columna aún no existe (migración
+    pendiente), nunca bloquea el envío por error."""
+    try:
+        row = db.execute(
+            text("SELECT recibir_promociones FROM clientes WHERE id=:id"), {"id": int(cliente_id)}
+        ).first()
+        if row is None or row[0] is None:
+            return True
+        return bool(row[0])
+    except Exception:
+        return True
+
+
 # ── Helpers internos: suscripciones y lectura de notificaciones ──────────────
 def _guardar_suscripcion(db: Session, tipo: str, uid: str, sub: dict, dispositivo: Optional[str]):
-    """
-    Guarda o actualiza la suscripción push.
-    Un mismo endpoint se actualiza en lugar de duplicarse.
-    """
     endpoint = sub.get("endpoint", "")
     sub_json = json.dumps(sub)
     try:
@@ -289,7 +344,7 @@ def _get_notificaciones(db: Session, tipo: str, uid: str) -> dict:
             text("""
                 SELECT id, titulo, cuerpo, url, leida, tipo, referencia_id, creado_en
                 FROM notificaciones
-                WHERE usuario_tipo=:tipo AND usuario_id=:uid AND tipo != 'promocion_enviada'
+                WHERE usuario_tipo=:tipo AND usuario_id=:uid AND tipo NOT IN ('promocion_enviada','promocion_producto_enviada')
                 ORDER BY creado_en DESC
                 LIMIT 50
             """),
@@ -299,7 +354,8 @@ def _get_notificaciones(db: Session, tipo: str, uid: str) -> dict:
         no_leidas = db.execute(
             text("""
                 SELECT COUNT(*) FROM notificaciones
-                WHERE usuario_tipo=:tipo AND usuario_id=:uid AND leida=false AND tipo != 'promocion_enviada'
+                WHERE usuario_tipo=:tipo AND usuario_id=:uid AND leida=false
+                  AND tipo NOT IN ('promocion_enviada','promocion_producto_enviada')
             """),
             {"tipo": tipo, "uid": uid}
         ).scalar() or 0
@@ -338,7 +394,7 @@ def _marcar_leidas(db: Session, tipo: str, uid: str):
 # ── Función pública de bajo nivel: crear notificación en DB + push + email ───
 async def crear_y_enviar_notificacion(
     db:           Session,
-    usuario_tipo: str,            # "cliente" | "vendedor"
+    usuario_tipo: str,
     usuario_id:   str,
     titulo:       str,
     cuerpo:       str,
@@ -348,15 +404,17 @@ async def crear_y_enviar_notificacion(
     email_to:     Optional[str]  = None,
     email_asunto: Optional[str]  = None,
     email_html:   Optional[str]  = None,
+    email_list_unsubscribe: Optional[str] = None,
 ):
     """
     Crea la notificación en BD, envía push al navegador y correo (si se
-    proveen). Cada paso está aislado: si el push o el email fallan, la
-    notificación in-app ya quedó guardada y el llamador no se entera del
-    error (por diseño — un correo caído nunca debe tumbar un flujo de
-    negocio como crear un pedido o cambiar su estado).
+    proveen). Cada paso está aislado: un push o email fallido nunca tumba
+    un flujo de negocio como crear un pedido o cambiar su estado.
+    `email_list_unsubscribe`: pásalo SOLO en correos promocionales/masivos
+    (promoción, sugerencia, nuevo producto) — ayuda mucho contra el filtro
+    de spam de Gmail/Yahoo. No es necesario en correos transaccionales
+    (nuevo pedido, cambio de estado).
     """
-    # 1. Guardar en BD (la fuente de verdad para la campana de notificaciones)
     try:
         db.execute(
             text("""
@@ -375,35 +433,25 @@ async def crear_y_enviar_notificacion(
         db.rollback()
         print(f"[NOTIF] Error guardando en BD: {e}")
 
-    # 2. Push al navegador (best-effort)
     try:
         from notifications.push_service import enviar_push_a_usuario
         await enviar_push_a_usuario(db, usuario_tipo, usuario_id, titulo, cuerpo, url)
     except Exception as e:
         print(f"[NOTIF] Error enviando push: {e}")
 
-    # 3. Correo electrónico (opcional, best-effort)
     if email_to and email_asunto and email_html:
         try:
             from notifications.email_service import enviar_email
-            await enviar_email(email_to, email_asunto, email_html)
+            await enviar_email(email_to, email_asunto, email_html, list_unsubscribe=email_list_unsubscribe)
         except Exception as e:
             print(f"[NOTIF] Error enviando email: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # HELPERS DE ALTO NIVEL POR EVENTO DE NEGOCIO
-# Estos son los que se llaman desde routes/pedidos.py, routes/chat.py y
-# routes/vendedor.py. Cada uno arma el título/cuerpo/URL/email correcto
-# para su evento y delega en crear_y_enviar_notificacion().
 # ══════════════════════════════════════════════════════════════════════════
 
 def _email_vendedor(db: Session, dni: str) -> Optional[str]:
-    """
-    El modelo Vendedor puede no tener `email` como columna ORM todavía
-    (se agregó por migración aparte en el registro) — se lee con SQL
-    crudo igual que en el resto del proyecto, con fallback silencioso.
-    """
     try:
         row = db.execute(text("SELECT email FROM vendedores WHERE dni=:d"), {"d": dni}).first()
         return row[0] if row and row[0] else None
@@ -412,7 +460,7 @@ def _email_vendedor(db: Session, dni: str) -> Optional[str]:
 
 
 async def notificar_nuevo_pedido_vendedor(db: Session, pedido, vendedor, cliente):
-    """Llamar desde pedidos.py justo después de crear el/los pedido(s)."""
+    """Transaccional — sin unsubscribe."""
     from notifications.email_service import html_nuevo_pedido_vendedor
 
     items_resumen = ", ".join(f"{it.nombre_producto} x{it.cantidad}" for it in pedido.items) or "—"
@@ -438,7 +486,7 @@ async def notificar_nuevo_pedido_vendedor(db: Session, pedido, vendedor, cliente
 
 
 async def notificar_cambio_estado_cliente(db: Session, pedido, cliente, nombre_tienda: str):
-    """Llamar desde pedidos.py después de actualizar_estado_pedido()."""
+    """Transaccional — sin unsubscribe."""
     from notifications.email_service import html_estado_pedido_cliente, ESTADO_LABEL
 
     html = None
@@ -461,12 +509,7 @@ async def notificar_cambio_estado_cliente(db: Session, pedido, cliente, nombre_t
 
 
 async def notificar_nuevo_mensaje_chat(db: Session, sala, remitente_tipo: str, contenido: str):
-    """
-    Llamar desde chat.py cada vez que se guarda un mensaje nuevo.
-    `remitente_tipo` es quien ENVIÓ el mensaje ('cliente' o 'vendedor') —
-    se notifica a la otra parte. Sin email: el chat ya es en tiempo real
-    por WebSocket, mandar correo por cada mensaje sería spam.
-    """
+    """Sin email: el chat ya es tiempo real por WS, mandar correo por mensaje sería spam."""
     preview = (contenido[:80] + "…") if len(contenido) > 80 else contenido
     if remitente_tipo == "cliente":
         await crear_y_enviar_notificacion(
@@ -485,11 +528,6 @@ async def notificar_nuevo_mensaje_chat(db: Session, sala, remitente_tipo: str, c
 
 
 def _clientes_interesados_en_categoria(db: Session, categoria: str, limite: int = 200) -> List[str]:
-    """
-    IDs de clientes que ya compraron algo de esta categoría antes — para
-    sugerirles un producto nuevo similar. Usa las relaciones ORM (no SQL
-    con nombres de tabla a mano).
-    """
     from models.pedido import Pedido, PedidoItem
     from models.producto import Producto as ProductoModel
 
@@ -518,13 +556,8 @@ def _clientes_previos_de_tienda(db: Session, vendedor_dni: str, limite: int = 50
     return [str(row[0]) for row in filas]
 
 
-async def notificar_nuevo_producto_interesados(db: Session, producto, vendedor, max_clientes: int = 100):
-    """
-    Llamar desde vendedor.py justo después de crear_producto(), por ejemplo:
-        prod = crear_producto(...)
-        await notificar_nuevo_producto_interesados(db, prod, vendedor)
-    Notifica a clientes que ya compraron antes en esta categoría.
-    """
+async def notificar_nuevo_producto_interesados(db: Session, producto, vendedor, max_clientes: int = 100) -> int:
+    """PROMOCIONAL — respeta recibir_promociones y lleva List-Unsubscribe."""
     from notifications.email_service import html_nuevo_producto_cliente
 
     clientes_ids = _clientes_interesados_en_categoria(db, producto.categoria)
@@ -538,46 +571,37 @@ async def notificar_nuevo_producto_interesados(db: Session, producto, vendedor, 
         if not cliente:
             continue
         try:
+            email_to = cliente.email if _acepta_promociones(db, cid) else None
             html = None
-            if cliente.email:
+            if email_to:
                 html = html_nuevo_producto_cliente(
                     cliente_nombre=cliente.nombres, nombre_producto=producto.nombre,
                     nombre_tienda=vendedor.nombre_tienda, precio=float(producto.precio),
                     categoria=producto.categoria, producto_id=str(producto.id), foto_url=foto_url,
+                    unsubscribe_url=_url_unsubscribe(cid),
                 )
             await crear_y_enviar_notificacion(
                 db, "cliente", cid,
                 titulo="Nuevo producto que podría interesarte",
                 cuerpo=f"{producto.nombre} en {vendedor.nombre_tienda} — L{float(producto.precio):.2f}",
                 url=f"/fenix/producto/{producto.id}", tipo="info",
-                email_to=cliente.email,
-                email_asunto=f"✨ Nuevo en {producto.categoria}: {producto.nombre}" if cliente.email else None,
+                email_to=email_to,
+                email_asunto=f"✨ Nuevo en {producto.categoria}: {producto.nombre}" if email_to else None,
                 email_html=html,
+                email_list_unsubscribe=_url_unsubscribe(cid) if email_to else None,
             )
             enviados += 1
         except Exception as e:
             print(f"[NUEVO_PRODUCTO] Error notificando a cliente {cid}: {e}")
     return enviados
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AGREGAR en backend/routes/notificaciones.py, justo después de la función
-# notificar_nuevo_producto_interesados() que ya tienes.
-# ─────────────────────────────────────────────────────────────────────────────
 
 async def notificar_promocion_producto(
     db: Session, producto, vendedor, nuevo_descuento: float, max_clientes: int = 150
 ) -> int:
-    """
-    Llamar desde vendedor.py (editar_producto) cuando se detecta que un
-    producto obtuvo un descuento NUEVO o MAYOR que el que tenía antes.
-
-    Limitado a 1 aviso cada 24h POR PRODUCTO (no por vendedor) — así, si el
-    vendedor sube/baja el precio varias veces en el día, los clientes no
-    reciben un correo cada vez. El rate-limit se guarda como una fila
-    "marcador" en la propia tabla notificaciones (usuario_tipo='vendedor',
-    tipo='promocion_producto_enviada', cuerpo=producto_id) para no requerir
-    una tabla nueva.
-    """
+    """PROMOCIONAL — respeta recibir_promociones y lleva List-Unsubscribe.
+    Rate-limit de 24h por producto (no por vendedor), guardado como fila
+    marcador en la propia tabla notificaciones."""
     try:
         reciente = db.execute(text("""
             SELECT 1 FROM notificaciones
@@ -607,25 +631,27 @@ async def notificar_promocion_producto(
         if not cliente:
             continue
         try:
+            email_to = cliente.email if _acepta_promociones(db, cid) else None
             html = None
-            if cliente.email:
+            if email_to:
                 html = html_promocion_cliente(
                     cliente_nombre=cliente.nombres, titulo=titulo, mensaje=mensaje,
                     nombre_tienda=vendedor.nombre_tienda, producto_id=str(producto.id),
+                    unsubscribe_url=_url_unsubscribe(cid),
                 )
             await crear_y_enviar_notificacion(
                 db, "cliente", cid,
                 titulo=titulo, cuerpo=mensaje, url=f"/fenix/producto/{producto.id}",
                 tipo="promocion",
-                email_to=cliente.email,
-                email_asunto=f"🔥 {titulo}" if cliente.email else None,
+                email_to=email_to,
+                email_asunto=f"🔥 {titulo}" if email_to else None,
                 email_html=html,
+                email_list_unsubscribe=_url_unsubscribe(cid) if email_to else None,
             )
             enviados += 1
         except Exception as e:
             print(f"[PROMOCION_PRODUCTO] Error notificando a cliente {cid}: {e}")
 
-    # Marca de rate-limit (y queda como registro/auditoría para el vendedor)
     try:
         db.execute(text("""
             INSERT INTO notificaciones (usuario_tipo, usuario_id, titulo, cuerpo, tipo)
@@ -639,13 +665,7 @@ async def notificar_promocion_producto(
 
 
 async def generar_sugerencias_preferencias(db: Session, dias_desde_ultima: int = 7, max_clientes: int = 500) -> int:
-    """
-    Job periódico (ver notifications/scheduler.py o el endpoint
-    /api/notificaciones/admin/generar-sugerencias). Por cada cliente con
-    historial de compras, si no se le ha sugerido nada en los últimos
-    `dias_desde_ultima` días, le sugiere hasta 3 productos activos de su
-    categoría más comprada que aún no haya comprado.
-    """
+    """PROMOCIONAL — respeta recibir_promociones y lleva List-Unsubscribe."""
     from models.pedido import Pedido, PedidoItem
     from models.producto import Producto as ProductoModel
     from notifications.email_service import html_sugerencia_cliente
@@ -662,7 +682,6 @@ async def generar_sugerencias_preferencias(db: Session, dias_desde_ultima: int =
     for (cid,) in clientes_ids:
         cid = str(cid)
 
-        # ¿Ya se le sugirió algo recientemente? (evita saturar al cliente)
         try:
             reciente = db.execute(text(f"""
                 SELECT 1 FROM notificaciones
@@ -675,7 +694,6 @@ async def generar_sugerencias_preferencias(db: Session, dias_desde_ultima: int =
         if reciente:
             continue
 
-        # Categoría más comprada por este cliente
         cat_row = (
             db.query(ProductoModel.categoria, func.count(ProductoModel.categoria).label("c"))
             .join(PedidoItem, PedidoItem.producto_id == ProductoModel.id)
@@ -689,7 +707,6 @@ async def generar_sugerencias_preferencias(db: Session, dias_desde_ultima: int =
             continue
         categoria = cat_row[0]
 
-        # Productos ya comprados por el cliente (para no repetir)
         ya_comprados = {
             row[0] for row in
             db.query(PedidoItem.producto_id)
@@ -714,18 +731,23 @@ async def generar_sugerencias_preferencias(db: Session, dias_desde_ultima: int =
             continue
 
         nombres_productos = ", ".join(p.nombre for p in sugeridos)
-        html = html_sugerencia_cliente(
-            cliente_nombre=cliente.nombres, categoria=categoria,
-            productos=[{"nombre": p.nombre, "precio": float(p.precio)} for p in sugeridos],
-        )
+        email_to = cliente.email if _acepta_promociones(db, cid) else None
+        html = None
+        if email_to:
+            html = html_sugerencia_cliente(
+                cliente_nombre=cliente.nombres, categoria=categoria,
+                productos=[{"nombre": p.nombre, "precio": float(p.precio)} for p in sugeridos],
+                unsubscribe_url=_url_unsubscribe(cid),
+            )
         await crear_y_enviar_notificacion(
             db, "cliente", cid,
             titulo=f"Productos de {categoria} para ti",
             cuerpo=f"Basado en tus compras: {nombres_productos}",
             url=f"/fenix/productos?categoria={categoria}", tipo="sugerencia",
-            email_to=cliente.email,
-            email_asunto="💡 Sugerencias para ti — Mercado Fénix" if cliente.email else None,
+            email_to=email_to,
+            email_asunto="💡 Sugerencias para ti — Mercado Fénix" if email_to else None,
             email_html=html,
+            email_list_unsubscribe=_url_unsubscribe(cid) if email_to else None,
         )
         enviados += 1
 
