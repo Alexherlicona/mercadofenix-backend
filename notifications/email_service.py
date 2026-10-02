@@ -1,33 +1,35 @@
 # backend/notifications/email_service.py
 #
 # Envío de correos transaccionales usando la API REST de Mailjet (v3.1).
-# Se eligió la API sobre SMTP porque: (1) da códigos de error claros por
-# mensaje, (2) permite reintentar solo lo que falló, (3) mejor entregabilidad
-# y estadísticas desde el panel de Mailjet.
 #
 # Variables de entorno requeridas en .env:
 #   MAILJET_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 #   MAILJET_API_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-#   MAILJET_FROM_EMAIL=notificaciones@tudominio.com   ← debe estar verificado en Mailjet
+#   MAILJET_FROM_EMAIL=notificaciones@tudominio.com   ← dominio verificado en Mailjet (SPF+DKIM), no un Gmail suelto
 #   EMAIL_FROM_NAME=Mercado Fénix
 #   FRONTEND_URL=https://mercadofenix.com
 #
-# Cómo conseguir las llaves: https://app.mailjet.com/account/apikeys
-# El plan gratuito de Mailjet da 200 emails/día y no requiere tarjeta.
-#
-# IMPORTANTE: MAILJET_FROM_EMAIL debe ser un remitente verificado en tu
-# cuenta de Mailjet (Account Settings → Sender addresses) o los envíos
-# fallarán con 401/403.
+# IMPORTANTE PARA EVITAR SPAM (ver también la guía de configuración de DNS):
+#   1. Verifica un DOMINIO completo en Mailjet (no solo una dirección suelta)
+#      y agrega los registros SPF/DKIM que te da Mailjet a tu DNS, más un
+#      registro DMARC. Sin esto, ningún ajuste de código evita el spam.
+#   2. Cada correo se manda con HTMLPart Y TextPart (versión texto plano) —
+#      faltar la versión texto es una señal clásica de spam.
+#   3. Los correos promocionales/masivos (promoción, sugerencia, nuevo
+#      producto) llevan el header List-Unsubscribe — Gmail/Yahoo lo exigen
+#      desde 2024 para remitentes de correo masivo o penalizan mandando
+#      todo a spam.
 
 import os
+import re
 import time
 import requests
 from typing import Optional, List, Dict
 import asyncio
 from datetime import datetime
 
-MAILJET_API_KEY    = os.getenv("MAILJET_API_KEY", "")
-MAILJET_API_SECRET = os.getenv("MAILJET_API_SECRET", "")
+MAILJET_API_KEY     = os.getenv("MAILJET_API_KEY", "")
+MAILJET_API_SECRET  = os.getenv("MAILJET_API_SECRET", "")
 MAILJET_FROM_EMAIL  = os.getenv("MAILJET_FROM_EMAIL", "notificaciones@mercadofenix.com")
 FROM_NAME      = os.getenv("EMAIL_FROM_NAME", "Mercado Fénix")
 FRONTEND_URL   = os.getenv("FRONTEND_URL",    "http://localhost:3000")
@@ -65,8 +67,19 @@ ESTADO_DESC = {
 }
 
 
+# ── Pie de "darse de baja" — solo se agrega en correos promocionales ─────────
+def _pie_unsubscribe(unsubscribe_url: str) -> str:
+    return f"""
+    <p style="margin:16px 0 0;color:#9ca3af;font-size:11px;text-align:center;">
+      <a href="{unsubscribe_url}" style="color:#9ca3af;text-decoration:underline;">
+        Dejar de recibir promociones y sugerencias
+      </a>
+    </p>"""
+
+
 # ── Base HTML del email ───────────────────────────────────────────────────────
-def _base_html(titulo: str, cuerpo: str) -> str:
+def _base_html(titulo: str, cuerpo: str, unsubscribe_url: Optional[str] = None) -> str:
+    pie_baja = _pie_unsubscribe(unsubscribe_url) if unsubscribe_url else ""
     return f"""<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -102,6 +115,7 @@ def _base_html(titulo: str, cuerpo: str) -> str:
               © {datetime.now().year} Mercado Fénix · Honduras<br>
               <a href="{FRONTEND_URL}" style="color:#f97316;text-decoration:none;">mercadofenix.com</a>
             </p>
+            {pie_baja}
           </td>
         </tr>
 
@@ -129,7 +143,7 @@ def _item_fila(label: str, valor: str) -> str:
     </tr>"""
 
 
-# ── Template: Nuevo pedido → Vendedor ────────────────────────────────────────
+# ── Template: Nuevo pedido → Vendedor (transaccional, sin unsubscribe) ───────
 def html_nuevo_pedido_vendedor(
     nombre_tienda:  str,
     pedido_id:      int,
@@ -167,7 +181,7 @@ def html_nuevo_pedido_vendedor(
     return _base_html(f"Nuevo pedido #{pedido_id} — Mercado Fénix", cuerpo)
 
 
-# ── Template: Cambio de estado → Cliente ─────────────────────────────────────
+# ── Template: Cambio de estado → Cliente (transaccional, sin unsubscribe) ───
 def html_estado_pedido_cliente(
     cliente_nombre: str,
     pedido_id:      int,
@@ -214,7 +228,7 @@ def html_estado_pedido_cliente(
     return _base_html(f"Pedido #{pedido_id}: {label} — Mercado Fénix", cuerpo)
 
 
-# ── Template: Nuevo producto (según preferencias) → Cliente ──────────────────
+# ── Template: Nuevo producto (según preferencias) → Cliente — PROMOCIONAL ───
 def html_nuevo_producto_cliente(
     cliente_nombre:  str,
     nombre_producto: str,
@@ -223,6 +237,7 @@ def html_nuevo_producto_cliente(
     categoria:       str,
     producto_id:     str,
     foto_url:        Optional[str] = None,
+    unsubscribe_url: Optional[str] = None,
 ) -> str:
     imagen_bloque = (
         f'<img src="{foto_url}" alt="{nombre_producto}" '
@@ -245,16 +260,17 @@ def html_nuevo_producto_cliente(
       Te avisamos porque has comprado productos similares antes en Mercado Fénix.
     </p>
     """
-    return _base_html(f"Nuevo en {categoria}: {nombre_producto}", cuerpo)
+    return _base_html(f"Nuevo en {categoria}: {nombre_producto}", cuerpo, unsubscribe_url)
 
 
-# ── Template: Promoción de una tienda → Cliente ───────────────────────────────
+# ── Template: Promoción de una tienda → Cliente — PROMOCIONAL ───────────────
 def html_promocion_cliente(
     cliente_nombre: str,
     titulo:         str,
     mensaje:        str,
     nombre_tienda:  str,
     producto_id:    Optional[str] = None,
+    unsubscribe_url: Optional[str] = None,
 ) -> str:
     boton = (
         _btn("Ver oferta", f"{FRONTEND_URL}/fenix/producto/{producto_id}")
@@ -272,14 +288,15 @@ def html_promocion_cliente(
       Recibes esto porque compraste antes en {nombre_tienda} a través de Mercado Fénix.
     </p>
     """
-    return _base_html(f"{titulo} — {nombre_tienda}", cuerpo)
+    return _base_html(f"{titulo} — {nombre_tienda}", cuerpo, unsubscribe_url)
 
 
-# ── Template: Sugerencias de productos según historial → Cliente ─────────────
+# ── Template: Sugerencias de productos según historial → Cliente — PROMOCIONAL
 def html_sugerencia_cliente(
     cliente_nombre: str,
     categoria:      str,
     productos:      List[Dict],   # [{"nombre": str, "precio": float}, ...]
+    unsubscribe_url: Optional[str] = None,
 ) -> str:
     filas = "".join(
         f'<tr><td style="padding:10px 0;border-bottom:1px solid #f3f4f6;color:#111827;'
@@ -299,33 +316,55 @@ def html_sugerencia_cliente(
       Basado en tu historial de compras en Mercado Fénix.
     </p>
     """
-    return _base_html(f"Sugerencias en {categoria} — Mercado Fénix", cuerpo)
+    return _base_html(f"Sugerencias en {categoria} — Mercado Fénix", cuerpo, unsubscribe_url)
+
+
+# ── Texto plano a partir del HTML (versión TextPart, evita filtro de spam) ───
+def _html_a_texto_plano(html: str) -> str:
+    texto = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+    texto = re.sub(r"<br\s*/?>", "\n", texto, flags=re.IGNORECASE)
+    texto = re.sub(r"</p>|</div>|</tr>|</h\d>", "\n", texto, flags=re.IGNORECASE)
+    texto = re.sub(r"<[^>]+>", "", texto)
+    texto = re.sub(r"[ \t]+", " ", texto)
+    texto = re.sub(r"\n{3,}", "\n\n", texto)
+    return texto.strip()
 
 
 # ── Función de envío (síncrona; se llama desde asyncio.to_thread) ────────────
-def _enviar_sync(destinatario: str, asunto: str, html: str) -> bool:
+def _enviar_sync(
+    destinatario: str, asunto: str, html: str,
+    list_unsubscribe: Optional[str] = None,
+) -> bool:
     """
     Envía un correo vía la API REST de Mailjet (v3.1).
-    - Reintenta ante errores transitorios (timeouts, 429, 5xx) con backoff.
-    - NO reintenta ante errores permanentes (4xx que no sea 429: credenciales
-      inválidas, remitente no verificado, destinatario mal formado, etc.) —
-      reintentar eso solo desperdicia tiempo, el resultado sería el mismo.
-    - Nunca lanza excepción: devuelve True/False. El llamador decide qué
-      hacer (aquí solo se loguea; la notificación en la app ya quedó guardada
-      en BD sin importar si el correo falla).
+    - Incluye TextPart (texto plano) además de HTMLPart: un correo que SOLO
+      trae HTML es una señal clásica de spam para los filtros.
+    - Si se pasa `list_unsubscribe` (una URL), agrega el header
+      List-Unsubscribe + List-Unsubscribe-Post=One-Click, que Gmail/Yahoo
+      exigen desde 2024 para remitentes de correo masivo/promocional.
+    - Reintenta ante errores transitorios (timeouts, 429, 5xx) con backoff;
+      NO reintenta ante errores permanentes (credenciales, remitente no
+      verificado, etc.) — reintentar eso solo desperdicia tiempo.
+    - Nunca lanza excepción: devuelve True/False.
     """
     if not MAILJET_API_KEY or not MAILJET_API_SECRET:
         print(f"[EMAIL] Credenciales de Mailjet no configuradas. Asunto: {asunto} → {destinatario}")
         return False
 
-    payload = {
-        "Messages": [{
-            "From": {"Email": MAILJET_FROM_EMAIL, "Name": FROM_NAME},
-            "To":   [{"Email": destinatario}],
-            "Subject":  asunto,
-            "HTMLPart": html,
-        }]
+    mensaje: Dict = {
+        "From": {"Email": MAILJET_FROM_EMAIL, "Name": FROM_NAME},
+        "To":   [{"Email": destinatario}],
+        "Subject":  asunto,
+        "HTMLPart": html,
+        "TextPart": _html_a_texto_plano(html),
     }
+    if list_unsubscribe:
+        mensaje["Headers"] = {
+            "List-Unsubscribe": f"<{list_unsubscribe}>",
+            "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+        }
+
+    payload = {"Messages": [mensaje]}
 
     ultimo_error = None
     for intento in range(1, MAX_REINTENTOS + 1):
@@ -341,10 +380,8 @@ def _enviar_sync(destinatario: str, asunto: str, html: str) -> bool:
                 return True
 
             if resp.status_code == 429 or resp.status_code >= 500:
-                # Rate limit o error del servidor de Mailjet → vale la pena reintentar
                 ultimo_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
             else:
-                # Error permanente (400/401/403 por ejemplo) → no reintentar
                 print(f"[EMAIL] ✗ Mailjet rechazó el envío a {destinatario}: "
                       f"HTTP {resp.status_code} — {resp.text[:200]}")
                 return False
@@ -353,18 +390,21 @@ def _enviar_sync(destinatario: str, asunto: str, html: str) -> bool:
             ultimo_error = str(e)
 
         if intento < MAX_REINTENTOS:
-            time.sleep(BACKOFF_BASE_SEGUNDOS * intento)  # 2s, 4s...
+            time.sleep(BACKOFF_BASE_SEGUNDOS * intento)
 
     print(f"[EMAIL] ✗ Falló el envío a {destinatario} tras {MAX_REINTENTOS} intentos: {ultimo_error}")
     return False
 
 
-async def enviar_email(destinatario: str, asunto: str, html: str) -> bool:
+async def enviar_email(
+    destinatario: str, asunto: str, html: str,
+    list_unsubscribe: Optional[str] = None,
+) -> bool:
     """Wrapper async — no bloquea el event loop de FastAPI."""
     if not destinatario:
         return False
     try:
-        return await asyncio.to_thread(_enviar_sync, destinatario, asunto, html)
+        return await asyncio.to_thread(_enviar_sync, destinatario, asunto, html, list_unsubscribe)
     except Exception as e:
         print(f"[EMAIL] ✗ Error inesperado enviando a {destinatario}: {e}")
         return False
