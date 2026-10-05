@@ -9,9 +9,10 @@ from models.vendedor import Vendedor
 from models.cliente import Cliente
 from passlib.context import CryptContext
 from core.security import SECRET_KEY, ALGORITHM
+from sqlalchemy import or_
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 días
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 60  # 60 días
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
@@ -69,19 +70,24 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
     )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        telefono: str = payload.get("sub")
-        role: str = payload.get("role")
+        sub = payload.get("sub")
+        role = payload.get("role")
+        cliente_id = payload.get("cliente_id")
 
-        # ✅ FIX: Antes fallaba si role era None (tokens viejos sin role)
-        # Ahora acepta role=="cliente" O role ausente (retrocompatibilidad)
-        if not telefono:
+        if not sub and not cliente_id:
             raise credentials_exception
         if role is not None and role != "cliente":
             raise credentials_exception
     except JWTError:
         raise credentials_exception
 
-    user = db.query(Cliente).filter(Cliente.telefono == telefono).first()
+    user = None
+    if cliente_id:
+        user = db.query(Cliente).filter(Cliente.id == cliente_id).first()
+    if not user and sub:
+        user = db.query(Cliente).filter(
+            or_(Cliente.telefono == sub, Cliente.email == sub)
+        ).first()
     if not user:
         raise credentials_exception
     return user
