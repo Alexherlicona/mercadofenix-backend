@@ -59,23 +59,19 @@ async def registro(cliente: ClienteRegistro, db: Session = Depends(get_db)):
 
 @router.post("/login")
 async def login(login_data: LoginData, db: Session = Depends(get_db)):
-    """
-    Recibe JSON: { "telefono": "...", "password": "..." }
-    El frontend DEBE enviar Content-Type: application/json.
-    Si enviás form-data, FastAPI lanza 422 automáticamente.
-    """
     user = db.query(Cliente).filter(Cliente.telefono == login_data.telefono).first()
-    if not user or not verify_password(login_data.password, user.password_hash):
+
+    # Usuarios creados con Google no tienen password_hash (es None)
+    if not user or not user.password_hash or not verify_password(login_data.password, user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Teléfono o contraseña incorrectos",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user.telefono, "role": "cliente"},
-        expires_delta=access_token_expires
+        data={"sub": user.telefono, "role": "cliente", "cliente_id": user.id},
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
 
     return {
@@ -86,9 +82,8 @@ async def login(login_data: LoginData, db: Session = Depends(get_db)):
             "nombres": user.nombres,
             "apellidos": user.apellidos,
             "telefono": user.telefono,
-        }
+        },
     }
-
 
 @router.put("/perfil")
 async def actualizar_perfil(
