@@ -126,57 +126,69 @@ async def google_callback(
     cliente = None
 
     # 1. Buscar por google_id (ya se registró con Google antes)
-    try:
-        from sqlalchemy import text
-        row = db.execute(
-            text("SELECT id FROM clientes WHERE google_id = :gid LIMIT 1"),
-            {"gid": google_id}
-        ).first()
-        if row:
-            cliente = db.query(Cliente).filter(Cliente.id == row.id).first()
-    except Exception:
-        pass
+        # ── Buscar o crear el cliente ─────────────────────────────────────────
+    from sqlalchemy import text
+    import traceback
 
-    # 2. Buscar por email (tiene cuenta normal, vincular Google)
-    if not cliente:
-        cliente = db.query(Cliente).filter(Cliente.email == email).first()
-        if cliente:
-            # Vincular la cuenta existente con Google
-            try:
+    try:
+        cliente = None
+
+        # 1. Por google_id
+        try:
+            row = db.execute(
+                text("SELECT id FROM clientes WHERE google_id = :gid LIMIT 1"),
+                {"gid": google_id}
+            ).first()
+            if row:
+                cliente = db.query(Cliente).filter(Cliente.id == row.id).first()
+        except Exception as e:
+            db.rollback()
+            print(f"[GOOGLE] Lookup por google_id falló (¿falta la columna?): {e}", flush=True)
+
+        # 2. Por email (cuenta normal existente, vincular Google)
+        if not cliente:
+            cliente = db.query(Cliente).filter(Cliente.email == email).first()
+            if cliente:
+                try:
+                    db.execute(
+                        text("UPDATE clientes SET google_id=:gid, avatar_url=:av, oauth_provider='google', email_verified=true WHERE id=:id"),
+                        {"gid": google_id, "av": avatar_url, "id": cliente.id}
+                    )
+                    db.commit()
+                except Exception as e:
+                    db.rollback()
+                    print(f"[GOOGLE] No se pudo vincular cuenta: {e}", flush=True)
+
+        # 3. Crear cliente nuevo
+        if not cliente:
+            cliente = Cliente(
+                nombres=nombre or "Usuario",
+                apellidos=apellido or "Google",
+                email=email,
+                telefono=None,
+                password_hash=None,
+                departamento="",
+                municipio="",
+                direccion_exacta="",
+            )
+            db.add(cliente)
+            db.commit()          # primero guardamos el cliente
+            db.refresh(cliente)
+
+            try:                 # y luego los campos OAuth, sin arriesgar lo anterior
                 db.execute(
                     text("UPDATE clientes SET google_id=:gid, avatar_url=:av, oauth_provider='google', email_verified=true WHERE id=:id"),
                     {"gid": google_id, "av": avatar_url, "id": cliente.id}
                 )
                 db.commit()
-            except Exception:
+            except Exception as e:
                 db.rollback()
+                print(f"[GOOGLE] No se guardaron campos OAuth: {e}", flush=True)
 
-    # 3. Crear cliente nuevo (primera vez con Google)
-    if not cliente:
-        cliente = Cliente(
-            nombres         = nombre or "Usuario",
-            apellidos       = apellido or "Google",
-            email           = email,
-            telefono        = None,       # opcional — puede completarlo luego
-            password_hash   = None,       # sin contraseña para usuarios OAuth
-            departamento    = "",
-            municipio       = "",
-            direccion_exacta= "",
-        )
-        db.add(cliente)
-        db.flush()
-
-        # Guardar campos OAuth
-        try:
-            db.execute(
-                text("UPDATE clientes SET google_id=:gid, avatar_url=:av, oauth_provider='google', email_verified=true WHERE id=:id"),
-                {"gid": google_id, "av": avatar_url, "id": cliente.id}
-            )
-        except Exception:
-            pass
-
-        db.commit()
-        db.refresh(cliente)
+    except Exception as e:
+        db.rollback()
+        print("[GOOGLE] ERROR creando/buscando cliente:\n" + traceback.format_exc(), flush=True)
+        raise HTTPException(500, f"Error de base de datos: {type(e).__name__}")
 
     # ── Generar nuestro JWT ───────────────────────────────────────────────
     # Usamos el teléfono si existe, si no usamos el email como identificador
