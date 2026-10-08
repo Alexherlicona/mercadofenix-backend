@@ -102,6 +102,11 @@ async def actualizar_perfil(
 
     if update_data.direccion_exacta is not None:
         current_user.direccion_exacta = update_data.direccion_exacta
+        
+    for campo in ("nombres", "apellidos", "departamento", "municipio"):
+        valor = getattr(update_data, campo, None)
+        if valor is not None:
+            setattr(current_user, campo, valor)
 
     db.commit()
     db.refresh(current_user)
