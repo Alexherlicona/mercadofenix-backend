@@ -23,6 +23,8 @@ from core.database import get_db
 from core.security import create_access_token
 from core.auth import ACCESS_TOKEN_EXPIRE_MINUTES
 from models.cliente import Cliente
+from sqlalchemy import func
+import traceback
 
 router = APIRouter()
 
@@ -110,103 +112,65 @@ async def google_callback(
         raise HTTPException(400, "Error al obtener datos del usuario de Google")
 
     gdata = user_res.json()
-    # gdata contiene: sub (google_id), email, name, given_name, family_name, picture
 
-    google_id  = gdata.get("sub")
-    email      = gdata.get("email", "").lower()
-    nombre     = gdata.get("given_name")  or gdata.get("name", "").split()[0]
-    apellido   = gdata.get("family_name") or " ".join(gdata.get("name", "").split()[1:])
-    avatar_url = gdata.get("picture")
-    verified   = gdata.get("email_verified", False)
-
+    google_id = gdata.get("sub")
+    email     = (gdata.get("email") or "").lower().strip()
     if not google_id or not email:
         raise HTTPException(400, "Google no devolvió los datos necesarios")
+    if not gdata.get("email_verified", False):
+        raise HTTPException(400, "Tu correo de Google no está verificado")
 
-    # ── Buscar o crear el cliente ─────────────────────────────────────────
-    cliente = None
-
-    # 1. Buscar por google_id (ya se registró con Google antes)
-        # ── Buscar o crear el cliente ─────────────────────────────────────────
-    from sqlalchemy import text
-    import traceback
+    partes     = (gdata.get("name") or "").split()
+    nombre     = gdata.get("given_name") or (partes[0] if partes else "Usuario")
+    apellido   = gdata.get("family_name") or " ".join(partes[1:])
+    avatar_url = gdata.get("picture")
 
     try:
-        cliente = None
+        # 1. Ya se registró con Google
+        cliente = db.query(Cliente).filter(Cliente.google_id == google_id).first()
 
-        # 1. Por google_id
-        try:
-            row = db.execute(
-                text("SELECT id FROM clientes WHERE google_id = :gid LIMIT 1"),
-                {"gid": google_id}
-            ).first()
-            if row:
-                cliente = db.query(Cliente).filter(Cliente.id == row.id).first()
-        except Exception as e:
-            db.rollback()
-            print(f"[GOOGLE] Lookup por google_id falló (¿falta la columna?): {e}", flush=True)
-
-        # 2. Por email (cuenta normal existente, vincular Google)
+        # 2. Cuenta existente por email: vincular
         if not cliente:
-            cliente = db.query(Cliente).filter(Cliente.email == email).first()
+            cliente = db.query(Cliente).filter(func.lower(Cliente.email) == email).first()
             if cliente:
-                try:
-                    db.execute(
-                        text("UPDATE clientes SET google_id=:gid, avatar_url=:av, oauth_provider='google', email_verified=true WHERE id=:id"),
-                        {"gid": google_id, "av": avatar_url, "id": cliente.id}
-                    )
-                    db.commit()
-                except Exception as e:
-                    db.rollback()
-                    print(f"[GOOGLE] No se pudo vincular cuenta: {e}", flush=True)
+                cliente.google_id      = google_id
+                cliente.oauth_provider = cliente.oauth_provider or "google"
+                cliente.email_verified = True
+                cliente.avatar_url     = avatar_url
 
-        # 3. Crear cliente nuevo
+        # 3. Cliente nuevo
         if not cliente:
             cliente = Cliente(
-                nombres=nombre or "Usuario",
-                apellidos=apellido or "Google",
-                email=email,
-                telefono=None,
-                password_hash=None,
-                departamento="",
-                municipio="",
-                direccion_exacta="",
+                nombres=nombre, apellidos=apellido, email=email,
+                telefono=None, password_hash=None,
+                departamento="", municipio="", direccion_exacta="",
+                google_id=google_id, avatar_url=avatar_url,
+                oauth_provider="google", email_verified=True,
             )
             db.add(cliente)
-            db.commit()          # primero guardamos el cliente
-            db.refresh(cliente)
 
-            try:                 # y luego los campos OAuth, sin arriesgar lo anterior
-                db.execute(
-                    text("UPDATE clientes SET google_id=:gid, avatar_url=:av, oauth_provider='google', email_verified=true WHERE id=:id"),
-                    {"gid": google_id, "av": avatar_url, "id": cliente.id}
-                )
-                db.commit()
-            except Exception as e:
-                db.rollback()
-                print(f"[GOOGLE] No se guardaron campos OAuth: {e}", flush=True)
-
+        db.commit()
+        db.refresh(cliente)
     except Exception as e:
         db.rollback()
-        print("[GOOGLE] ERROR creando/buscando cliente:\n" + traceback.format_exc(), flush=True)
+        print("[GOOGLE] ERROR:\n" + traceback.format_exc(), flush=True)
         raise HTTPException(500, f"Error de base de datos: {type(e).__name__}")
 
-    # ── Generar nuestro JWT ───────────────────────────────────────────────
-    # Usamos el teléfono si existe, si no usamos el email como identificador
-    sub = cliente.telefono or email
     token = create_access_token(
-        data={"sub": sub, "role": "cliente", "cliente_id": cliente.id},
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        data={"sub": cliente.telefono or email, "role": "cliente", "cliente_id": cliente.id},
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
 
     return {
         "access_token": token,
-        "token_type":   "bearer",
+        "token_type": "bearer",
         "user": {
-            "id":        cliente.id,
-            "nombres":   cliente.nombres,
+            "id": cliente.id,
+            "nombres": cliente.nombres,
             "apellidos": cliente.apellidos,
-            "email":     cliente.email,
+            "email": cliente.email,
             "avatar_url": avatar_url,
-            "es_nuevo":  cliente.telefono is None,  # si es nuevo, pedir teléfono
-        }
+            "perfil_incompleto": not (cliente.telefono and cliente.departamento
+                                      and cliente.municipio and cliente.direccion_exacta),
+        },
     }
