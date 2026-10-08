@@ -1,5 +1,5 @@
 # backend/models/cliente.py - VERSIÓN ACTUALIZADA
-from sqlalchemy import Column, Integer, String, DateTime
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, Text
 from sqlalchemy.sql import func
 from core.database import Base
 from sqlalchemy.orm import relationship
@@ -18,6 +18,10 @@ class Cliente(Base):
     direccion_exacta = Column(String(255), nullable=True)
     creado_en = Column(DateTime(timezone=True), server_default=func.now())
     actualizado_en = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    google_id      = Column(String(64), unique=True, nullable=True)
+    avatar_url     = Column(Text, nullable=True)
+    oauth_provider = Column(String(20), nullable=True)
+    email_verified = Column(Boolean, default=False)
     
     # Relaciones
     favoritos = relationship("Favorito", back_populates="cliente", cascade="all, delete-orphan")
