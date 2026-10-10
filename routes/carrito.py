@@ -11,8 +11,15 @@ from typing import Optional
 from jose import jwt, JWTError
 from core.security import SECRET_KEY, ALGORITHM
 import uuid
-
+import os
 router = APIRouter(prefix="/api/carrito", tags=["carrito"])
+
+COOKIE_SECURE   = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+COOKIE_SAMESITE = "none" if COOKIE_SECURE else "lax"
+
+def get_session_id(request: Request) -> Optional[str]:
+    """Header primero (funciona entre dominios); cookie como respaldo."""
+    return request.headers.get("X-Cart-Session") or request.cookies.get("cart_session")
 
 
 # ─── HELPER: obtener cliente desde token (sin lanzar error si no hay token) ───
@@ -159,16 +166,19 @@ async def add_to_cart(request: Request, response: Response, db: Session = Depend
     cliente = get_cliente_opcional(request, db)
 
     # Gestionar cookie de sesión (sirve para anónimos y como fallback)
-    session_id = request.cookies.get("cart_session")
-    if not session_id:
-        session_id = str(uuid.uuid4())
+    session_id = get_session_id(request) or str(uuid.uuid4())
+
+    cart = get_or_create_carrito(db, session_id, cliente.id if cliente else None)
+
+    # Cookie solo como respaldo para invitados
+    if not cliente and request.cookies.get("cart_session") != cart.session_id:
         response.set_cookie(
             key="cart_session",
-            value=session_id,
+            value=cart.session_id,
             httponly=True,
             max_age=60 * 60 * 24 * 30,
-            samesite="lax",
-            secure=False
+            samesite=COOKIE_SAMESITE,
+            secure=COOKIE_SECURE,
         )
 
     cart = get_or_create_carrito(db, session_id, cliente.id if cliente else None)
@@ -179,8 +189,8 @@ async def add_to_cart(request: Request, response: Response, db: Session = Depend
             value=cart.session_id,
             httponly=True,
             max_age=60 * 60 * 24 * 30,
-            samesite="lax",
-            secure=False,
+            samesite=COOKIE_SAMESITE,
+            secure=COOKIE_SECURE,
         )
 
     # Buscar item existente (mismo producto + variantes)
@@ -219,14 +229,19 @@ async def add_to_cart(request: Request, response: Response, db: Session = Depend
     db.refresh(cart)
 
     total_items = sum(i.cantidad for i in cart.items)
-    return {"msg": "agregado", "total_items": total_items}
+    return {
+        "msg": "agregado",
+        "total_items": total_items,
+        # El frontend se queda con el ID real si el backend tuvo que rotarlo
+        "session_id": cart.session_id if not cliente else None,
+    }
 
 
 # ─── GET /mi-carrito ──────────────────────────────────────────────────────────
 @router.get("/mi-carrito")
 async def get_cart(request: Request, db: Session = Depends(get_db)):
     cliente = get_cliente_opcional(request, db)
-    session_id = request.cookies.get("cart_session")
+    session_id = get_session_id(request)
 
     if not session_id and not cliente:
         return {"items": [], "total": 0.0}
@@ -272,7 +287,7 @@ async def update_cart_item(item_id: int, request: Request, db: Session = Depends
     data = await request.json()
     nueva_cantidad = max(1, data.get("cantidad", 1))
     cliente = get_cliente_opcional(request, db)
-    session_id = request.cookies.get("cart_session")
+    session_id = get_session_id(request)
 
     # Verificar que el item pertenece al carrito correcto del usuario
     if cliente:
@@ -300,7 +315,7 @@ async def update_cart_item(item_id: int, request: Request, db: Session = Depends
 @router.delete("/remove/{item_id}")
 async def remove_from_cart(item_id: int, request: Request, db: Session = Depends(get_db)):
     cliente = get_cliente_opcional(request, db)
-    session_id = request.cookies.get("cart_session")
+    session_id = get_session_id(request)
 
     if cliente:
         item = db.query(CarritoItem).join(Carrito).filter(
@@ -328,7 +343,7 @@ async def remove_from_cart(item_id: int, request: Request, db: Session = Depends
 async def vaciar_carrito(request: Request, db: Session = Depends(get_db)):
     """Vaciar el carrito después de confirmar un pedido"""
     cliente = get_cliente_opcional(request, db)
-    session_id = request.cookies.get("cart_session")
+    session_id = get_session_id(request)
 
     if cliente:
         cart = db.query(Carrito).filter(Carrito.cliente_id == cliente.id).first()
@@ -353,7 +368,7 @@ async def merge_cart(request: Request, db: Session = Depends(get_db)):
     if not cliente:
         raise HTTPException(status_code=401, detail="Debes iniciar sesión")
 
-    session_id = request.cookies.get("cart_session")
+    session_id = get_session_id(request)
     cart = get_or_create_carrito(db, session_id, cliente.id)
     db.refresh(cart)
     return {"total_items": sum(i.cantidad for i in cart.items)}
