@@ -1,7 +1,8 @@
 # backend/routes/carrito.py
-from fastapi import APIRouter, Request, Response, Depends, Header
+from fastapi import APIRouter, Request, Response, Depends, Header, HTTPException
+from sqlalchemy import and_, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import and_
 from core.database import get_db
 from models.carrito import Carrito, CarritoItem
 from models.producto import FotoProducto, Producto
@@ -26,13 +27,25 @@ def get_cliente_opcional(request: Request, db: Session) -> Optional[Cliente]:
     token = auth.split(" ", 1)[1]
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        telefono = payload.get("sub")
         role = payload.get("role")
-        if not telefono or (role is not None and role != "cliente"):
+        if role is not None and role != "cliente":
             return None
-        return db.query(Cliente).filter(Cliente.telefono == telefono).first()
+
+        cliente_id = payload.get("cliente_id")
+        sub = payload.get("sub")
+
+        if cliente_id:
+            cliente = db.query(Cliente).filter(Cliente.id == cliente_id).first()
+            if cliente:
+                return cliente
+        if sub:
+            return db.query(Cliente).filter(
+                or_(Cliente.telefono == sub, Cliente.email == sub)
+            ).first()
+        return None
     except JWTError:
         return None
+    
 
 
 # ─── HELPER: obtener o crear carrito ─────────────────────────────────────────
@@ -95,8 +108,8 @@ def get_or_create_carrito(
             return carrito_cliente
 
         if carrito_anonimo:
-            # Adoptar el carrito anónimo
             carrito_anonimo.cliente_id = cliente_id
+            carrito_anonimo.session_id = str(uuid.uuid4())  # libera el de la cookie
             db.commit()
             db.refresh(carrito_anonimo)
             return carrito_anonimo
@@ -109,18 +122,33 @@ def get_or_create_carrito(
         return nuevo
 
     else:
-        # Usuario anónimo: buscar por session_id sin cliente
         carrito = db.query(Carrito).filter(
             Carrito.session_id == session_id,
             Carrito.cliente_id == None
         ).first()
+        if carrito:
+            return carrito
 
-        if not carrito:
-            carrito = Carrito(session_id=session_id, cliente_id=None)
-            db.add(carrito)
+        # Si ese session_id ya lo usa el carrito de un cliente (cookie vieja
+        # tras cerrar sesión), este visitante necesita una sesión nueva.
+        if db.query(Carrito.id).filter(Carrito.session_id == session_id).first():
+            session_id = str(uuid.uuid4())
+
+        carrito = Carrito(session_id=session_id, cliente_id=None)
+        db.add(carrito)
+        try:
             db.commit()
-            db.refresh(carrito)
-
+        except IntegrityError:
+            # Doble clic / dos peticiones simultáneas: gana la primera
+            db.rollback()
+            carrito = db.query(Carrito).filter(
+                Carrito.session_id == session_id,
+                Carrito.cliente_id == None
+            ).first()
+            if not carrito:
+                raise
+            return carrito
+        db.refresh(carrito)
         return carrito
 
 
@@ -144,6 +172,16 @@ async def add_to_cart(request: Request, response: Response, db: Session = Depend
         )
 
     cart = get_or_create_carrito(db, session_id, cliente.id if cliente else None)
+    
+    if not cliente and cart.session_id != session_id:
+        response.set_cookie(
+            key="cart_session",
+            value=cart.session_id,
+            httponly=True,
+            max_age=60 * 60 * 24 * 30,
+            samesite="lax",
+            secure=False,
+        )
 
     # Buscar item existente (mismo producto + variantes)
     existing_item = db.query(CarritoItem).filter(
@@ -307,3 +345,15 @@ async def vaciar_carrito(request: Request, db: Session = Depends(get_db)):
         db.commit()
 
     return {"msg": "carrito vaciado"}
+# ─── POST /merge ──────────────────────────────────────────────────────────────
+@router.post("/merge")
+async def merge_cart(request: Request, db: Session = Depends(get_db)):
+    """Se llama justo después de iniciar sesión: pasa el carrito de invitado al usuario."""
+    cliente = get_cliente_opcional(request, db)
+    if not cliente:
+        raise HTTPException(status_code=401, detail="Debes iniciar sesión")
+
+    session_id = request.cookies.get("cart_session")
+    cart = get_or_create_carrito(db, session_id, cliente.id)
+    db.refresh(cart)
+    return {"total_items": sum(i.cantidad for i in cart.items)}
