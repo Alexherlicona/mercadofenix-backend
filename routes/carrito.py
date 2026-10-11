@@ -12,6 +12,9 @@ from jose import jwt, JWTError
 from core.security import SECRET_KEY, ALGORITHM
 import uuid
 import os
+import re
+import unicodedata
+from models.vendedor import Vendedor
 router = APIRouter(prefix="/api/carrito", tags=["carrito"])
 
 COOKIE_SECURE   = os.getenv("COOKIE_SECURE", "false").lower() == "true"
@@ -372,3 +375,84 @@ async def merge_cart(request: Request, db: Session = Depends(get_db)):
     cart = get_or_create_carrito(db, session_id, cliente.id)
     db.refresh(cart)
     return {"total_items": sum(i.cantidad for i in cart.items)}
+
+# ─── Opciones de checkout según lo que configuró cada vendedor ────────────────
+PAGO_TODOS             = ["efectivo", "transferencia"]
+ENTREGA_VENDEDOR_TODOS = ["domicilio", "tienda"]
+ENTREGA_PLATAFORMA     = ["oficina_fenix"]  # no depende del vendedor
+
+
+def _norm(valor) -> str:
+    t = unicodedata.normalize("NFKD", str(valor or ""))
+    return t.encode("ascii", "ignore").decode().lower()
+
+
+def parsear_pago(valor) -> list[str]:
+    t = _norm(valor)
+    if not t.strip() or re.search(r"ambos|ambas|todos|todas", t):
+        return PAGO_TODOS[:]
+    res = []
+    if "efectivo" in t:
+        res.append("efectivo")
+    if "transfer" in t or "deposito" in t:
+        res.append("transferencia")
+    return res or PAGO_TODOS[:]  # valor irreconocible: no bloquear la venta
+
+
+def parsear_entrega(valor) -> list[str]:
+    t = _norm(valor)
+    if not t.strip() or re.search(r"ambos|ambas|todos|todas", t):
+        return ENTREGA_VENDEDOR_TODOS[:]
+    res = []
+    if "domicilio" in t or "envio" in t:
+        res.append("domicilio")
+    if any(k in t for k in ("tienda", "retiro", "recoger", "recojo")):
+        res.append("tienda")
+    return res or ENTREGA_VENDEDOR_TODOS[:]
+
+
+# ─── GET /opciones-checkout ───────────────────────────────────────────────────
+@router.get("/opciones-checkout")
+async def opciones_checkout(request: Request, db: Session = Depends(get_db)):
+    cliente = get_cliente_opcional(request, db)
+    if not cliente:
+        raise HTTPException(status_code=401, detail="Debes iniciar sesión")
+
+    cart = db.query(Carrito).options(joinedload(Carrito.items)).filter(
+        Carrito.cliente_id == cliente.id
+    ).first()
+
+    vendedores = []
+    if cart and cart.items:
+        producto_ids = {i.producto_id for i in cart.items}
+        filas = db.query(Producto.vendedor_id).filter(Producto.id.in_(producto_ids)).distinct().all()
+        vendedor_ids = [f[0] for f in filas if f[0] is not None]
+        if vendedor_ids:
+            vendedores = db.query(Vendedor).filter(Vendedor.id.in_(vendedor_ids)).all()
+
+    tiendas = []
+    pago_set = None
+    entrega_set = None
+    for v in vendedores:
+        pago = parsear_pago(v.tipo_pago)
+        entrega = parsear_entrega(v.tipo_entrega)
+        tiendas.append({
+            "nombre": getattr(v, "nombre_tienda", None) or getattr(v, "nombre", None) or "Tienda",
+            "pago": pago,
+            "entrega": entrega,
+        })
+        pago_set = set(pago) if pago_set is None else pago_set & set(pago)
+        entrega_set = set(entrega) if entrega_set is None else entrega_set & set(entrega)
+
+    if pago_set is None:
+        pago_set = set(PAGO_TODOS)
+    if entrega_set is None:
+        entrega_set = set(ENTREGA_VENDEDOR_TODOS)
+
+    return {
+        "pago": [p for p in PAGO_TODOS if p in pago_set],
+        "entrega": [e for e in ENTREGA_VENDEDOR_TODOS if e in entrega_set] + ENTREGA_PLATAFORMA,
+        "tiendas": tiendas,
+        # True si las tiendas del carrito no comparten ningún método de pago
+        "conflicto_pago": len(pago_set) == 0,
+    }
