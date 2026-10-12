@@ -15,6 +15,8 @@ import os
 import re
 import unicodedata
 from models.vendedor import Vendedor
+import traceback
+
 router = APIRouter(prefix="/api/carrito", tags=["carrito"])
 
 COOKIE_SECURE   = os.getenv("COOKIE_SECURE", "false").lower() == "true"
@@ -175,18 +177,6 @@ async def add_to_cart(request: Request, response: Response, db: Session = Depend
 
     # Cookie solo como respaldo para invitados
     if not cliente and request.cookies.get("cart_session") != cart.session_id:
-        response.set_cookie(
-            key="cart_session",
-            value=cart.session_id,
-            httponly=True,
-            max_age=60 * 60 * 24 * 30,
-            samesite=COOKIE_SAMESITE,
-            secure=COOKIE_SECURE,
-        )
-
-    cart = get_or_create_carrito(db, session_id, cliente.id if cliente else None)
-    
-    if not cliente and cart.session_id != session_id:
         response.set_cookie(
             key="cart_session",
             value=cart.session_id,
@@ -418,41 +408,58 @@ async def opciones_checkout(request: Request, db: Session = Depends(get_db)):
     if not cliente:
         raise HTTPException(status_code=401, detail="Debes iniciar sesión")
 
-    cart = db.query(Carrito).options(joinedload(Carrito.items)).filter(
-        Carrito.cliente_id == cliente.id
-    ).first()
-
-    vendedores = []
-    if cart and cart.items:
-        producto_ids = {i.producto_id for i in cart.items}
-        filas = db.query(Producto.vendedor_id).filter(Producto.id.in_(producto_ids)).distinct().all()
-        vendedor_ids = [f[0] for f in filas if f[0] is not None]
-        if vendedor_ids:
-            vendedores = db.query(Vendedor).filter(Vendedor.id.in_(vendedor_ids)).all()
-
-    tiendas = []
-    pago_set = None
-    entrega_set = None
-    for v in vendedores:
-        pago = parsear_pago(v.tipo_pago)
-        entrega = parsear_entrega(v.tipo_entrega)
-        tiendas.append({
-            "nombre": getattr(v, "nombre_tienda", None) or getattr(v, "nombre", None) or "Tienda",
-            "pago": pago,
-            "entrega": entrega,
-        })
-        pago_set = set(pago) if pago_set is None else pago_set & set(pago)
-        entrega_set = set(entrega) if entrega_set is None else entrega_set & set(entrega)
-
-    if pago_set is None:
-        pago_set = set(PAGO_TODOS)
-    if entrega_set is None:
-        entrega_set = set(ENTREGA_VENDEDOR_TODOS)
-
-    return {
-        "pago": [p for p in PAGO_TODOS if p in pago_set],
-        "entrega": [e for e in ENTREGA_VENDEDOR_TODOS if e in entrega_set] + ENTREGA_PLATAFORMA,
-        "tiendas": tiendas,
-        # True si las tiendas del carrito no comparten ningún método de pago
-        "conflicto_pago": len(pago_set) == 0,
+    # Por defecto todo permitido: el checkout no debe romperse por este endpoint
+    respuesta = {
+        "pago": PAGO_TODOS[:],
+        "entrega": ENTREGA_VENDEDOR_TODOS + ENTREGA_PLATAFORMA,
+        "tiendas": [],
+        "conflicto_pago": False,
     }
+
+    try:
+        cart = db.query(Carrito).options(joinedload(Carrito.items)).filter(
+            Carrito.cliente_id == cliente.id
+        ).first()
+        if not cart or not cart.items:
+            return respuesta
+
+        # str(): CarritoItem.producto_id puede ser UUID y Producto.id texto (o al revés)
+        producto_ids = list({str(i.producto_id) for i in cart.items})
+        filas = db.query(Producto.vendedor_id).filter(
+            Producto.id.in_(producto_ids)
+        ).distinct().all()
+        vendedor_ids = [f[0] for f in filas if f[0] is not None]
+        if not vendedor_ids:
+            return respuesta
+
+        vendedores = db.query(Vendedor).filter(Vendedor.id.in_(vendedor_ids)).all()
+
+        tiendas = []
+        pago_set = None
+        entrega_set = None
+        for v in vendedores:
+            pago = parsear_pago(v.tipo_pago)
+            entrega = parsear_entrega(v.tipo_entrega)
+            tiendas.append({
+                "nombre": getattr(v, "nombre_tienda", None) or getattr(v, "nombre", None) or "Tienda",
+                "pago": pago,
+                "entrega": entrega,
+            })
+            pago_set = set(pago) if pago_set is None else pago_set & set(pago)
+            entrega_set = set(entrega) if entrega_set is None else entrega_set & set(entrega)
+
+        if pago_set is None:
+            pago_set = set(PAGO_TODOS)
+        if entrega_set is None:
+            entrega_set = set(ENTREGA_VENDEDOR_TODOS)
+
+        return {
+            "pago": [p for p in PAGO_TODOS if p in pago_set],
+            "entrega": [e for e in ENTREGA_VENDEDOR_TODOS if e in entrega_set] + ENTREGA_PLATAFORMA,
+            "tiendas": tiendas,
+            "conflicto_pago": len(pago_set) == 0,
+        }
+    except Exception:
+        db.rollback()
+        print("[CHECKOUT] opciones-checkout falló:\n" + traceback.format_exc(), flush=True)
+        return respuesta
