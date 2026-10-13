@@ -31,7 +31,7 @@ router = APIRouter(prefix="/vendedor", tags=["redes-sociales"])
 META_APP_ID     = os.getenv("META_APP_ID", "")
 META_APP_SECRET = os.getenv("META_APP_SECRET", "")
 META_GRAPH_URL  = "https://graph.facebook.com/v19.0"
-PLATAFORMA_URL  = os.getenv("PLATAFORMA_URL", "https://mercadofenix.hn")
+PLATAFORMA_URL  = os.getenv("PLATAFORMA_URL", "https://mercadofenix.vercel.app")  # Cambiar a tu dominio real en producción
 
 
 # ── Modelo SQLAlchemy ─────────────────────────────────────────────────────────
@@ -334,7 +334,7 @@ async def auto_publicar_actualizacion(
         return
 
     slug = slug_tienda(vendedor.nombre_tienda, vendedor.municipio)
-    url  = f"{PLATAFORMA_URL}/tienda/{slug}/producto/{producto['id']}"
+    url = f"{PLATAFORMA_URL}/fenix/tiendas/{slug}?producto={producto['id']}"
     precio = producto.get("precio_con_descuento") or producto.get("precio", 0)
     texto = (
         f"¡Nuevo producto en {vendedor.nombre_tienda}! 🎉\n\n"
