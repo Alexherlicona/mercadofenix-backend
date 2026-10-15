@@ -25,13 +25,52 @@ from models.vendedor import Vendedor
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
+import io, re, uuid
+from fastapi.responses import RedirectResponse, Response
+from models.producto import Producto, FotoProducto   # ajusta la ruta si difiere
+
+API_PUBLIC_URL = os.getenv("API_PUBLIC_URL", "")      # ej: https://tu-api.onrender.com
 
 router = APIRouter(prefix="/vendedor", tags=["redes-sociales"])
+router_publico = APIRouter(prefix="/public", tags=["public-social"])
 
 META_APP_ID     = os.getenv("META_APP_ID", "")
 META_APP_SECRET = os.getenv("META_APP_SECRET", "")
 META_GRAPH_URL  = "https://graph.facebook.com/v19.0"
 PLATAFORMA_URL  = os.getenv("PLATAFORMA_URL", "https://mercadofenix.vercel.app")  # Cambiar a tu dominio real en producción
+
+def _to_uuid(v):
+    try:
+        return uuid.UUID(str(v))
+    except Exception:
+        return None
+
+
+def _cloudinary_social(url: str) -> Optional[str]:
+    """Cloudinary -> JPEG cuadrado 1080x1080 con fondo blanco. None si no es Cloudinary."""
+    if url and "res.cloudinary.com" in url and "/upload/" in url:
+        u = url.replace("/upload/", "/upload/f_jpg,q_auto:good,c_pad,b_white,w_1080,h_1080/", 1)
+        return re.sub(r"\.(webp|png|jpe?g|gif|avif)$", ".jpg", u, flags=re.I)
+    return None
+
+
+def primera_foto_url(db: Session, producto_id: str) -> Optional[str]:
+    pid = _to_uuid(producto_id)
+    if not pid:
+        return None
+    f = (db.query(FotoProducto)
+           .filter(FotoProducto.producto_id == pid, FotoProducto.es_video == False)
+           .order_by(FotoProducto.orden.asc(), FotoProducto.id.asc())
+           .first())
+    return f.url if f else None
+
+
+def foto_social_publica(db: Session, producto_id: str) -> Optional[str]:
+    """URL pública y compatible con Meta (JPEG) de la portada del producto."""
+    url = primera_foto_url(db, producto_id)
+    if not url:
+        return None
+    return _cloudinary_social(url) or f"{API_PUBLIC_URL}/api/public/producto/{producto_id}/foto-social.jpg"
 
 
 # ── Modelo SQLAlchemy ─────────────────────────────────────────────────────────
@@ -148,6 +187,38 @@ async def publicar_instagram(ig_user_id: str, page_token: str, texto: str, foto_
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+
+@router_publico.get("/producto/{producto_id}/foto-social.jpg")
+async def foto_social(producto_id: str, db: Session = Depends(get_db)):
+    url = primera_foto_url(db, producto_id)
+    if not url:
+        raise HTTPException(404, "Producto sin foto")
+
+    # Cloudinary: redirige a la versión transformada
+    social = _cloudinary_social(url)
+    if social:
+        return RedirectResponse(social, status_code=302)
+
+    # Fallback (foto en disco local): convertir con Pillow  ->  pip install Pillow
+    from PIL import Image
+    origen = url if url.startswith("http") else f"{API_PUBLIC_URL}{url}"
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
+        r = await c.get(origen)
+        r.raise_for_status()
+
+    img = Image.open(io.BytesIO(r.content)).convert("RGBA")
+    base = Image.new("RGBA", img.size, (255, 255, 255, 255))
+    base.alpha_composite(img)                      # aplana transparencia sobre blanco
+    img = base.convert("RGB")
+    img.thumbnail((1080, 1080))
+    lienzo = Image.new("RGB", (1080, 1080), (255, 255, 255))
+    lienzo.paste(img, ((1080 - img.width) // 2, (1080 - img.height) // 2))
+
+    buf = io.BytesIO()
+    lienzo.save(buf, "JPEG", quality=88)
+    return Response(buf.getvalue(), media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
 @router.get("/redes-sociales")
 async def listar_redes(
     vendedor: Vendedor = Depends(get_current_vendedor),
@@ -260,51 +331,57 @@ async def desconectar_red(
 @router.post("/publicar-red-social")
 async def publicar_en_red(
     payload: PublicarPayload,
-    background_tasks: BackgroundTasks,
     vendedor: Vendedor = Depends(get_current_vendedor),
     db: Session = Depends(get_db)
 ):
-    """
-    Publica un producto en la red solicitada usando el token guardado.
-    Si no hay token → error 400 para que el frontend haga Nivel A.
-    """
     reg = db.query(RedSocialVendedor).filter(
         RedSocialVendedor.vendedor_dni == vendedor.dni,
         RedSocialVendedor.red == payload.red,
         RedSocialVendedor.conectada == True
     ).first()
-
     if not reg or not reg.access_token:
         raise HTTPException(400, detail=f"Red {payload.red} no conectada. Usa compartir manual.")
 
+    # El producto debe ser del vendedor (ajusta el nombre del campo dueño si es distinto)
+    pid = _to_uuid(payload.producto_id)
+    prod = db.query(Producto).filter(
+        Producto.id == pid, Producto.vendedor_dni == vendedor.dni
+    ).first() if pid else None
+    if not prod:
+        raise HTTPException(404, detail="Producto no encontrado.")
+
+    # La portada se resuelve en el servidor (se ignora payload.foto_url)
+    foto_url = foto_social_publica(db, payload.producto_id)
+
     try:
-        post_id = None
         if payload.red == "facebook":
-            result  = await publicar_facebook(reg.page_id, reg.access_token, payload.texto, payload.foto_url)
-            post_id = result.get("id") or result.get("post_id")
+            result   = await publicar_facebook(reg.page_id, reg.access_token, payload.texto, foto_url)
+            post_id  = result.get("post_id") or result.get("id")
             post_url = f"https://www.facebook.com/{post_id}" if post_id else None
 
         elif payload.red == "instagram":
             if not reg.ig_user_id:
                 raise HTTPException(400, detail="No tienes cuenta Instagram Business vinculada.")
-            if not payload.foto_url:
-                raise HTTPException(400, detail="Instagram requiere al menos una foto.")
-            result  = await publicar_instagram(reg.ig_user_id, reg.access_token, payload.texto, payload.foto_url)
+            if not foto_url:
+                raise HTTPException(400, detail="Instagram requiere que el producto tenga al menos una foto.")
+            result  = await publicar_instagram(reg.ig_user_id, reg.access_token, payload.texto, foto_url)
             post_id = result.get("id")
-            post_url = f"https://www.instagram.com/p/{post_id}" if post_id else None
+            post_url = None
+            if post_id:  # el id NO es el shortcode de la URL; se pide el permalink real
+                async with httpx.AsyncClient() as c:
+                    pr = await c.get(f"{META_GRAPH_URL}/{post_id}",
+                                     params={"fields": "permalink", "access_token": reg.access_token})
+                    post_url = pr.json().get("permalink")
         else:
             raise HTTPException(400, detail=f"Red {payload.red} no soportada.")
 
-        # Actualizar contador y fecha
-        reg.posts_total  = (reg.posts_total or 0) + 1
-        reg.ultimo_post  = datetime.utcnow()
+        reg.posts_total = (reg.posts_total or 0) + 1
+        reg.ultimo_post = datetime.utcnow()
         db.commit()
-
         return {"ok": True, "post_id": post_id, "post_url": post_url}
 
     except httpx.HTTPStatusError as e:
         raise HTTPException(400, detail=f"Error de Meta API: {e.response.text}")
-
 
 # ── Función helper para auto-publicar al actualizar un producto ───────────────
 async def auto_publicar_actualizacion(
@@ -343,9 +420,7 @@ async def auto_publicar_actualizacion(
         f"Ver más: {url}"
     )
 
-    foto_url = None
-    if producto.get("fotos") and len(producto["fotos"]) > 0:
-        foto_url = f"{PLATAFORMA_URL}{producto['fotos'][0]['url']}" if not producto["fotos"][0]["url"].startswith("http") else producto["fotos"][0]["url"]
+    foto_url = foto_social_publica(db, producto["id"])
 
     for reg in redes_activas:
         try:
