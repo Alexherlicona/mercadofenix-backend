@@ -15,7 +15,7 @@ from routes.favorito import router as favorito_router
 from routes.pedidos import router as pedidos_router
 from routes.direcciones import router as direcciones_router
 from routes.chat import router as chat_router
-from routes.social import router as social_router
+from routes.social import router as social_router, router_publico as social_publico_router
 from routes.descargas import router as descargas_router
 from routes.reportes import router as reportes_router
 from routes.google_auth import router as google_router
@@ -65,6 +65,7 @@ app.include_router(pedidos_router)
 app.include_router(direcciones_router)
 app.include_router(chat_router)
 app.include_router(social_router)
+app.include_router(social_publico_router, prefix="/api")
 app.include_router(descargas_router)
 app.include_router(google_router, prefix="/api")
 app.include_router(notificaciones_router)
