@@ -325,6 +325,18 @@ async def actualizar_estado(
         raise HTTPException(status_code=400, detail=f"Estado inválido")
 
     pedido = actualizar_estado_pedido(db, pedido_id, update_data.estado, update_data.nota_vendedor)
+    
+    if update_data.estado == "entregado":
+        stock_actualizado = True
+        for item in pedido.items:
+            producto = db.query(Producto).filter(Producto.id == item.producto_id).first()
+            if producto and producto.tipo == "fisico":
+                if producto.stock is not None and producto.stock >= item.cantidad:
+                    producto.stock -= item.cantidad
+                    db.query(Producto).filter(Producto.id == item.producto_id).update({"stock": producto.stock})
+                else:
+                    stock_actualizado = False
+                    break
 
     # ── Notificar al cliente el cambio de estado (in-app + push + email) ─────
     try:
