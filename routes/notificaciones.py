@@ -95,7 +95,8 @@ async def suscribir_cliente(
     current_user = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    _guardar_suscripcion(db, "cliente", str(current_user.id), body.subscription, body.dispositivo)
+    if not _guardar_suscripcion(db, "cliente", str(current_user.id), body.subscription, body.dispositivo):
+        raise HTTPException(500, "No se pudo guardar la suscripción push. Revisa los logs del backend y que la tabla push_subscriptions exista.")
     return {"ok": True}
 
 
@@ -106,7 +107,8 @@ async def suscribir_vendedor(
     current_vendedor = Depends(get_current_vendedor),
     db: Session = Depends(get_db),
 ):
-    _guardar_suscripcion(db, "vendedor", current_vendedor.dni, body.subscription, body.dispositivo)
+    if not _guardar_suscripcion(db, "vendedor", current_vendedor.dni, body.subscription, body.dispositivo):
+        raise HTTPException(500, "No se pudo guardar la suscripción push. Revisa los logs del backend y que la tabla push_subscriptions exista.")
     return {"ok": True}
 
 
@@ -277,6 +279,25 @@ def unsubscribe_promociones(cliente_id: int, token: str, db: Session = Depends(g
     """)
 
 
+# ── Diagnóstico: manda un push de prueba y explica qué está fallando ─────────
+@router.post("/probar-push")
+async def probar_push_cliente(
+    current_user = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    from notifications.push_service import diagnosticar_y_enviar_prueba
+    return await diagnosticar_y_enviar_prueba(db, "cliente", str(current_user.id))
+
+
+@router.post("/vendedor/probar-push")
+async def probar_push_vendedor(
+    current_vendedor = Depends(get_current_vendedor),
+    db: Session = Depends(get_db),
+):
+    from notifications.push_service import diagnosticar_y_enviar_prueba
+    return await diagnosticar_y_enviar_prueba(db, "vendedor", current_vendedor.dni)
+
+
 # ── Helpers internos: token de unsubscribe y preferencia del cliente ─────────
 def _token_unsubscribe(cliente_id: int) -> str:
     return hmac.new(SECRET_KEY.encode(), str(cliente_id).encode(), hashlib.sha256).hexdigest()[:32]
@@ -305,13 +326,29 @@ def _acepta_promociones(db: Session, cliente_id) -> bool:
 def _guardar_suscripcion(db: Session, tipo: str, uid: str, sub: dict, dispositivo: Optional[str]):
     endpoint = sub.get("endpoint", "")
     sub_json = json.dumps(sub)
+
+    # Buscar si este mismo navegador (mismo endpoint) ya estaba registrado.
+    # Se compara en Python en vez de usar una columna `endpoint_hash` en SQL:
+    # esa columna NO existe en la tabla según la migración original, así que
+    # la consulta anterior fallaba, dejaba la transacción de Postgres en
+    # estado abortado, y el INSERT siguiente también fallaba → la suscripción
+    # NUNCA se guardaba (y el endpoint igual respondía {"ok": True}).
+    existing = None
     try:
-        existing = db.execute(
-            text("SELECT id FROM push_subscriptions WHERE endpoint_hash=md5(:ep) AND usuario_id=:uid AND usuario_tipo=:tipo"),
-            {"ep": endpoint, "uid": uid, "tipo": tipo}
-        ).first()
-    except Exception:
-        existing = None
+        filas = db.execute(
+            text("SELECT id, subscription_json FROM push_subscriptions WHERE usuario_id=:uid AND usuario_tipo=:tipo"),
+            {"uid": uid, "tipo": tipo}
+        ).fetchall()
+        for fila in filas:
+            try:
+                if json.loads(fila[1]).get("endpoint") == endpoint:
+                    existing = fila
+                    break
+            except Exception:
+                continue
+    except Exception as e:
+        db.rollback()   # imprescindible en Postgres tras un error, o todo lo siguiente falla
+        print(f"[PUSH] Error buscando suscripción existente: {e}")
 
     try:
         if existing:
@@ -333,9 +370,11 @@ def _guardar_suscripcion(db: Session, tipo: str, uid: str, sub: dict, dispositiv
                 {"tipo": tipo, "uid": uid, "sub": sub_json, "dev": dispositivo}
             )
         db.commit()
+        return True
     except Exception as e:
         db.rollback()
-        print(f"[PUSH] Error guardando suscripción: {e}")
+        print(f"[PUSH] Error guardando suscripción (¿existe la tabla push_subscriptions?): {e}")
+        return False
 
 
 def _get_notificaciones(db: Session, tipo: str, uid: str) -> dict:
