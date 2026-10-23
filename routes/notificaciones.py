@@ -319,6 +319,10 @@ def _acepta_promociones(db: Session, cliente_id) -> bool:
             return True
         return bool(row[0])
     except Exception:
+        # Si la columna aún no existe, la consulta falla y Postgres deja la
+        # transacción abortada: hay que hacer rollback o el siguiente
+        # INSERT en `notificaciones` también fallaría.
+        db.rollback()
         return True
 
 
@@ -454,6 +458,7 @@ async def crear_y_enviar_notificacion(
     de spam de Gmail/Yahoo. No es necesario en correos transaccionales
     (nuevo pedido, cambio de estado).
     """
+    print(f"[NOTIF] → {usuario_tipo}:{usuario_id} | {tipo} | {titulo} | email={'sí' if email_to else 'no'}")
     try:
         db.execute(
             text("""
@@ -474,7 +479,8 @@ async def crear_y_enviar_notificacion(
 
     try:
         from notifications.push_service import enviar_push_a_usuario
-        await enviar_push_a_usuario(db, usuario_tipo, usuario_id, titulo, cuerpo, url)
+        resumen = await enviar_push_a_usuario(db, usuario_tipo, usuario_id, titulo, cuerpo, url)
+        print(f"[PUSH] resumen {usuario_tipo}:{usuario_id} → {resumen}")
     except Exception as e:
         print(f"[NOTIF] Error enviando push: {e}")
 
@@ -494,7 +500,11 @@ def _email_vendedor(db: Session, dni: str) -> Optional[str]:
     try:
         row = db.execute(text("SELECT email FROM vendedores WHERE dni=:d"), {"d": dni}).first()
         return row[0] if row and row[0] else None
-    except Exception:
+    except Exception as e:
+        # Sin este rollback, en Postgres la transacción queda abortada y el
+        # INSERT de la notificación (siguiente paso) falla también.
+        db.rollback()
+        print(f"[NOTIF] No se pudo leer el email del vendedor (¿falta la columna vendedores.email?): {e}")
         return None
 
 
