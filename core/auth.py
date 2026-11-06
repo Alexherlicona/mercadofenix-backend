@@ -7,12 +7,15 @@ from core.database import get_db
 from models.admin import Admin
 from models.vendedor import Vendedor
 from models.cliente import Cliente
-from passlib.context import CryptContext
 from core.security import SECRET_KEY, ALGORITHM
 from sqlalchemy import or_
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 60  # 60 días
+try:
+    from passlib.context import CryptContext
+    pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+except Exception:
+    pwd_context = None
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 días
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
