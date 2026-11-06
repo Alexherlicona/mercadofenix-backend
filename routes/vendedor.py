@@ -669,19 +669,17 @@ async def editar_producto(
         producto.stock = int(form.get("stock"))
 
     # 3. Aplicar orden drag & drop a TODAS las fotos existentes del producto
-    #    PostgreSQL valida UNIQUE (producto_id, orden) fila por fila durante
-    #    el UPDATE, así que no podemos asignar ordenes intermedios que colisionen.
-    #    CHECK limita orden a 0..9, sin valores temporales fuera de rango.
-    #    Estrategia: calcular mapeo final y ejecutar updates uno por uno,
-    #    moviendo primero las fotos cuyo destino esté libre (ninguna otra
-    #    foto no-movida ocupa ese orden). Nunca hay dos fotos con el mismo
-    #    orden al mismo tiempo.
+    #    PostgreSQL valida UNIQUE (producto_id, orden) fila por fila en cada
+    #    UPDATE, y CHECK limita orden a 0..9 (no hay ordenes temporales libres).
+    #    Estrategia robusta: DELETE + re-INSERT de todas las fotos existentes
+    #    con los nuevos ordenes, evitando estados intermedios con duplicados.
     orden_ids = form.getlist("orden_fotos")
     todas_fotos = db.query(FotoProducto).filter(
         FotoProducto.producto_id == producto.id
     ).order_by(FotoProducto.orden).all()
 
     if todas_fotos:
+        # Calcular nuevo orden para cada foto (0, 1, 2, ...)
         orden_set = set()
         mapeo = {}
         for idx, fid_str in enumerate(orden_ids):
@@ -702,42 +700,26 @@ async def editar_producto(
                 mapeo[f.id] = orden_actual
                 orden_actual += 1
 
-        ordenes_actuales = {f.id: f.orden for f in todas_fotos}
-        movidas = set()
-        while len(movidas) < len(todas_fotos):
-            avanzó = False
-            for foto_id, nuevo_orden in mapeo.items():
-                if foto_id in movidas:
-                    continue
-                if ordenes_actuales[foto_id] == nuevo_orden:
-                    movidas.add(foto_id)
-                    avanzó = True
-                    continue
-                destino_libre = True
-                for otra_id, orden in ordenes_actuales.items():
-                    if otra_id not in movidas and otra_id != foto_id and orden == nuevo_orden:
-                        destino_libre = False
-                        break
-                if destino_libre:
-                    db.execute(text("""
-                        UPDATE fotos_productos
-                        SET orden = :orden
-                        WHERE id = :fid AND producto_id = :pid
-                    """), {"orden": nuevo_orden, "fid": foto_id, "pid": producto.id})
-                    ordenes_actuales[foto_id] = nuevo_orden
-                    movidas.add(foto_id)
-                    avanzó = True
-            if not avanzó:
-                for foto_id, nuevo_orden in mapeo.items():
-                    if foto_id not in movidas:
-                        db.execute(text("""
-                            UPDATE fotos_productos
-                            SET orden = :orden
-                            WHERE id = :fid AND producto_id = :pid
-                        """), {"orden": nuevo_orden, "fid": foto_id, "pid": producto.id})
-                        ordenes_actuales[foto_id] = nuevo_orden
-                        movidas.add(foto_id)
-                        break
+        # Guardar datos antes de borrar
+        fotos_data = [
+            (f.id, f.url, f.es_video, f.alt_texto, mapeo[f.id])
+            for f in todas_fotos
+        ]
+
+        # Eliminar todas las fotos existentes
+        for f in todas_fotos:
+            db.delete(f)
+        db.flush()
+
+        # Re-insertar con nuevos ordenes (IDs únicos, ordenes únicos → sin violar UNIQUE)
+        for fid, url, es_video, alt_texto, nuevo_orden in fotos_data:
+            db.execute(text("""
+                INSERT INTO fotos_productos (id, producto_id, url, orden, es_video, alt_texto)
+                VALUES (:fid, :pid, :url, :orden, :es_video, :alt_texto)
+            """), {
+                "fid": fid, "pid": producto.id, "url": url,
+                "orden": nuevo_orden, "es_video": es_video, "alt_texto": alt_texto,
+            })
 
     # 4. Añadir fotos nuevas
     nuevo_orden = db.query(FotoProducto).filter(FotoProducto.producto_id == producto.id).count()
