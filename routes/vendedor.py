@@ -669,30 +669,75 @@ async def editar_producto(
         producto.stock = int(form.get("stock"))
 
     # 3. Aplicar orden drag & drop a TODAS las fotos existentes del producto
-    #    Usamos una sola sentencia SQL UPDATE ... FROM (VALUES ...) para que
-    #    PostgreSQL valide las restricciones (UNIQUE + CHECK) al final de la
-    #    sentencia, no fila por fila como hace executemany con valores
-    #    intermedios. Esto evita colisiones de orden y CheckViolation.
+    #    PostgreSQL valida UNIQUE (producto_id, orden) fila por fila durante
+    #    el UPDATE, así que no podemos asignar ordenes intermedios que colisionen.
+    #    CHECK limita orden a 0..9, sin valores temporales fuera de rango.
+    #    Estrategia: calcular mapeo final y ejecutar updates uno por uno,
+    #    moviendo primero las fotos cuyo destino esté libre (ninguna otra
+    #    foto no-movida ocupa ese orden). Nunca hay dos fotos con el mismo
+    #    orden al mismo tiempo.
     orden_ids = form.getlist("orden_fotos")
     todas_fotos = db.query(FotoProducto).filter(
         FotoProducto.producto_id == producto.id
     ).order_by(FotoProducto.orden).all()
 
     if todas_fotos:
-        if orden_ids:
-            updates = [(int(fid), idx) for idx, fid in enumerate(orden_ids)]
-        else:
-            updates = [(f.id, idx) for idx, f in enumerate(todas_fotos)]
+        orden_set = set()
+        mapeo = {}
+        for idx, fid_str in enumerate(orden_ids):
+            try:
+                fid = int(fid_str)
+            except ValueError:
+                continue
+            if fid in orden_set:
+                continue
+            orden_set.add(fid)
+            foto = next((f for f in todas_fotos if f.id == fid), None)
+            if foto:
+                mapeo[foto.id] = idx
 
-        if updates:
-            values_sql = ", ".join(f"({uid}, {orden})" for uid, orden in updates)
-            db.execute(text(f"""
-                UPDATE fotos_productos
-                SET orden = v.orden
-                FROM (VALUES {values_sql}) AS v(id, orden)
-                WHERE fotos_productos.id = v.id
-                  AND fotos_productos.producto_id = :producto_id
-            """), {"producto_id": producto.id})
+        orden_actual = len(mapeo)
+        for f in todas_fotos:
+            if f.id not in orden_set:
+                mapeo[f.id] = orden_actual
+                orden_actual += 1
+
+        ordenes_actuales = {f.id: f.orden for f in todas_fotos}
+        movidas = set()
+        while len(movidas) < len(todas_fotos):
+            avanzó = False
+            for foto_id, nuevo_orden in mapeo.items():
+                if foto_id in movidas:
+                    continue
+                if ordenes_actuales[foto_id] == nuevo_orden:
+                    movidas.add(foto_id)
+                    avanzó = True
+                    continue
+                destino_libre = True
+                for otra_id, orden in ordenes_actuales.items():
+                    if otra_id not in movidas and otra_id != foto_id and orden == nuevo_orden:
+                        destino_libre = False
+                        break
+                if destino_libre:
+                    db.execute(text("""
+                        UPDATE fotos_productos
+                        SET orden = :orden
+                        WHERE id = :fid AND producto_id = :pid
+                    """), {"orden": nuevo_orden, "fid": foto_id, "pid": producto.id})
+                    ordenes_actuales[foto_id] = nuevo_orden
+                    movidas.add(foto_id)
+                    avanzó = True
+            if not avanzó:
+                for foto_id, nuevo_orden in mapeo.items():
+                    if foto_id not in movidas:
+                        db.execute(text("""
+                            UPDATE fotos_productos
+                            SET orden = :orden
+                            WHERE id = :fid AND producto_id = :pid
+                        """), {"orden": nuevo_orden, "fid": foto_id, "pid": producto.id})
+                        ordenes_actuales[foto_id] = nuevo_orden
+                        movidas.add(foto_id)
+                        break
 
     # 4. Añadir fotos nuevas
     nuevo_orden = db.query(FotoProducto).filter(FotoProducto.producto_id == producto.id).count()
