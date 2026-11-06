@@ -668,40 +668,24 @@ async def editar_producto(
     if producto.tipo == "fisico" and form.get("stock"):
         producto.stock = int(form.get("stock"))
 
-    # 3. Aplicar orden drag & drop
+    # 3. Aplicar orden drag & drop a TODAS las fotos existentes del producto
     orden_ids = form.getlist("orden_fotos")
-    if orden_ids:
-        # Paso 1: asignar ordenes temporales negativos para liberar los ordenes
-        # originales y evitar colisiones con la constraint UNIQUE (producto_id, orden).
-        fotos_a_ordenar = db.query(FotoProducto).filter(
-            FotoProducto.id.in_([int(fid) for fid in orden_ids]),
-            FotoProducto.producto_id == producto.id
-        ).all()
-        for tmp_idx, foto in enumerate(fotos_a_ordenar):
-            foto.orden = -(tmp_idx + 1)
+    todas_fotos = db.query(FotoProducto).filter(
+        FotoProducto.producto_id == producto.id
+    ).order_by(FotoProducto.orden).all()
+
+    if todas_fotos:
+        # Paso 1: asignar ordenes temporales muy altos (1000000 + idx) para
+        # evitar colisiones con la constraint UNIQUE (producto_id, orden) y
+        # respetar el CHECK (orden >= 0).
+        for tmp_idx, foto in enumerate(todas_fotos):
+            foto.orden = 1000000 + tmp_idx
         db.flush()
 
-        # Paso 2: asignar los ordenes finales según el orden arrastrado.
-        for idx, fid_str in enumerate(orden_ids):
-            try:
-                foto = db.query(FotoProducto).filter(
-                    FotoProducto.id == int(fid_str),
-                    FotoProducto.producto_id == producto.id
-                ).first()
-                if foto: foto.orden = idx
-            except Exception: pass
-    else:
-        # Paso 1: ordenes temporales negativos.
-        todas = db.query(FotoProducto).filter(
-            FotoProducto.producto_id == producto.id
-        ).order_by(FotoProducto.orden).all()
-        for tmp_idx, foto in enumerate(todas):
-            foto.orden = -(tmp_idx + 1)
-        db.flush()
-
-        # Paso 2: ordenes finales secuenciales.
-        for idx, foto in enumerate(todas):
-            foto.orden = idx
+        # Paso 2: asignar ordenes finales según el nuevo orden arrastrado.
+        orden_map = {int(fid): idx for idx, fid in enumerate(orden_ids)} if orden_ids else {}
+        for idx, foto in enumerate(todas_fotos):
+            foto.orden = orden_map.get(foto.id, idx)
 
     # 4. Añadir fotos nuevas
     nuevo_orden = db.query(FotoProducto).filter(FotoProducto.producto_id == producto.id).count()
