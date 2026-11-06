@@ -156,8 +156,9 @@ async def google_callback(
         print("[GOOGLE] ERROR:\n" + traceback.format_exc(), flush=True)
         raise HTTPException(500, f"Error de base de datos: {type(e).__name__}")
 
+    sub_claim = cliente.telefono or cliente.email or str(cliente.id)
     token = create_access_token(
-        data={"sub": cliente.telefono or email, "role": "cliente", "cliente_id": cliente.id},
+        data={"sub": sub_claim, "role": "cliente", "cliente_id": cliente.id},
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
 
