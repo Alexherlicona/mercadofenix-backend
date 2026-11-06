@@ -669,23 +669,30 @@ async def editar_producto(
         producto.stock = int(form.get("stock"))
 
     # 3. Aplicar orden drag & drop a TODAS las fotos existentes del producto
+    #    Usamos una sola sentencia SQL UPDATE ... FROM (VALUES ...) para que
+    #    PostgreSQL valide las restricciones (UNIQUE + CHECK) al final de la
+    #    sentencia, no fila por fila como hace executemany con valores
+    #    intermedios. Esto evita colisiones de orden y CheckViolation.
     orden_ids = form.getlist("orden_fotos")
     todas_fotos = db.query(FotoProducto).filter(
         FotoProducto.producto_id == producto.id
     ).order_by(FotoProducto.orden).all()
 
     if todas_fotos:
-        # Paso 1: asignar ordenes temporales muy altos (1000000 + idx) para
-        # evitar colisiones con la constraint UNIQUE (producto_id, orden) y
-        # respetar el CHECK (orden >= 0).
-        for tmp_idx, foto in enumerate(todas_fotos):
-            foto.orden = 1000000 + tmp_idx
-        db.flush()
+        if orden_ids:
+            updates = [(int(fid), idx) for idx, fid in enumerate(orden_ids)]
+        else:
+            updates = [(f.id, idx) for idx, f in enumerate(todas_fotos)]
 
-        # Paso 2: asignar ordenes finales según el nuevo orden arrastrado.
-        orden_map = {int(fid): idx for idx, fid in enumerate(orden_ids)} if orden_ids else {}
-        for idx, foto in enumerate(todas_fotos):
-            foto.orden = orden_map.get(foto.id, idx)
+        if updates:
+            values_sql = ", ".join(f"({uid}, {orden})" for uid, orden in updates)
+            db.execute(text(f"""
+                UPDATE fotos_productos
+                SET orden = v.orden
+                FROM (VALUES {values_sql}) AS v(id, orden)
+                WHERE fotos_productos.id = v.id
+                  AND fotos_productos.producto_id = :producto_id
+            """), {"producto_id": producto.id})
 
     # 4. Añadir fotos nuevas
     nuevo_orden = db.query(FotoProducto).filter(FotoProducto.producto_id == producto.id).count()
