@@ -6,6 +6,9 @@ from fastapi.staticfiles import StaticFiles
 from scheduler import iniciar_scheduler
 from notifications.scheduler import start_scheduler
 import os
+import httpx
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 from routes.admin import router as admin_router
 from routes.vendedor import router as vendedor_router
 from routes.public import router as public_router
@@ -29,12 +32,26 @@ cloudinary.config(
 
 app = FastAPI(title="Mercado Fénix 2025")
 
+origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8000",
+    "https://mercadofenix-backend.onrender.com",
+    "https://mercadofenix.vercel.app",
+]
+env_origins = os.getenv("CORS_ORIGINS")
+if env_origins:
+    for o in env_origins.split(","):
+        o2 = o.strip()
+        if o2 and o2 not in origins:
+            origins.append(o2)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8000", "https://mercadofenix-backend.onrender.com", "https://mercadofenix.vercel.app"],
+    allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Requested-With", "X-Cart-Session"],
 )
 
 # === ARCHIVOS ESTÁTICOS ===
@@ -49,14 +66,8 @@ app.mount("/digitales", StaticFiles(directory="public/digitales"), name="digital
 
 # === ROUTERS ===
 app.include_router(admin_router, prefix="/api")
-
-# ✅ FIX: vendedor_router estaba registrado DOS veces con prefijos distintos,
-# causando que las rutas se duplicaran y generaran conflictos en el routing.
-# Elegí /api/vendedor como prefijo canónico. Si tus rutas internas ya incluyen
-# /vendedor, dejá solo prefix="/api". Ajustá según tu routes/vendedor.py.
-app.include_router(vendedor_router, prefix="/api")
-app.include_router(vendedor_router, prefix="/api/vendedor")  # ELIMINAR ESTE REGISTRO DUPLICADO SI YA TENÉS /api/vendedor EN ELLO
-app.include_router(reportes_router, prefix="/api")  # Asegúrate de que reportes_router tenga rutas únicas y no se dupliquen con admin_router o vendedor_router
+app.include_router(vendedor_router, prefix="/api")  # evita duplicados; usa rutas internas
+app.include_router(reportes_router, prefix="/api")
 app.include_router(public_router)
 app.include_router(carrito_router)
 app.include_router(auth_router)
@@ -74,6 +85,50 @@ async def root():
     return {"message": "Mercado Fénix API - PEDIDOS IMPLEMENTADOS ✅ - 2025 🔥"}
 
 
+@app.get("/ping")
+async def ping():
+    """Endpoint ligero sin DB ni auth para mantener vivo el backend en Render (free tier)."""
+    return {"status": "ok", "message": "Backend despierto"}
+
+
+# === DESPERTADOR / KEEP-ALIVE PARA RENDER (free tier se duerme tras inactividad) ===
+_keepalive_scheduler = AsyncIOScheduler(timezone="America/Tegucigalpa")
+
+
+async def _keepalive_ping():
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url:
+        return
+    url = url.rstrip("/") + "/ping"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url)
+            if resp.status_code == 200:
+                print("[KEEP-ALIVE] Ping exitoso a", url)
+            else:
+                print(f"[KEEP-ALIVE] Ping respondió {resp.status_code}")
+    except Exception as e:
+        print(f"[KEEP-ALIVE] Error haciendo ping: {e}")
+
+
+def iniciar_keepalive():
+    """Arranca el auto-ping solo si estamos en Render (RENDER_EXTERNAL_URL definido)."""
+    if not os.getenv("RENDER_EXTERNAL_URL"):
+        print("[KEEP-ALIVE] No está en Render, se omite auto-ping.")
+        return
+    if _keepalive_scheduler.running:
+        return
+    interval = int(os.getenv("RENDER_KEEPALIVE_INTERVAL_MIN", "10"))
+    _keepalive_scheduler.add_job(
+        _keepalive_ping,
+        trigger=IntervalTrigger(minutes=interval),
+        id="keepalive_render",
+        replace_existing=True,
+    )
+    _keepalive_scheduler.start()
+    print(f"[KEEP-ALIVE] Iniciado — auto-ping cada {interval} min a {os.getenv('RENDER_EXTERNAL_URL')}/ping")
+
+
 vendedores_db = {}
 
 @app.on_event("startup")
@@ -83,6 +138,10 @@ async def startup_event():
 @app.on_event("startup")
 async def begin_event():
     start_scheduler
+
+@app.on_event("startup")
+async def start_keepalive():
+    iniciar_keepalive()
 
 @app.post("/api/facturas/generar")
 async def generar_factura(
