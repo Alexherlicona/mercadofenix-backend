@@ -671,6 +671,17 @@ async def editar_producto(
     # 3. Aplicar orden drag & drop
     orden_ids = form.getlist("orden_fotos")
     if orden_ids:
+        # Paso 1: asignar ordenes temporales negativos para liberar los ordenes
+        # originales y evitar colisiones con la constraint UNIQUE (producto_id, orden).
+        fotos_a_ordenar = db.query(FotoProducto).filter(
+            FotoProducto.id.in_([int(fid) for fid in orden_ids]),
+            FotoProducto.producto_id == producto.id
+        ).all()
+        for tmp_idx, foto in enumerate(fotos_a_ordenar):
+            foto.orden = -(tmp_idx + 1)
+        db.flush()
+
+        # Paso 2: asignar los ordenes finales según el orden arrastrado.
         for idx, fid_str in enumerate(orden_ids):
             try:
                 foto = db.query(FotoProducto).filter(
@@ -680,11 +691,16 @@ async def editar_producto(
                 if foto: foto.orden = idx
             except Exception: pass
     else:
-        for idx, foto in enumerate(
-            db.query(FotoProducto)
-            .filter(FotoProducto.producto_id == producto.id)
-            .order_by(FotoProducto.orden).all()
-        ):
+        # Paso 1: ordenes temporales negativos.
+        todas = db.query(FotoProducto).filter(
+            FotoProducto.producto_id == producto.id
+        ).order_by(FotoProducto.orden).all()
+        for tmp_idx, foto in enumerate(todas):
+            foto.orden = -(tmp_idx + 1)
+        db.flush()
+
+        # Paso 2: ordenes finales secuenciales.
+        for idx, foto in enumerate(todas):
             foto.orden = idx
 
     # 4. Añadir fotos nuevas
