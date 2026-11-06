@@ -19,4 +19,10 @@ if not DATABASE_URL:
 if not JWT_SECRET:
     raise ValueError("JWT_SECRET no está configurada")
 
-print(f"✓ Config cargada — DB: {DATABASE_URL.split('@')[-1].split('/')[0] if '@' in DATABASE_URL else 'OK'}")
+if os.getenv("ENVIRONMENT", "dev").lower() == "prod":
+    print("✓ Config cargada")
+else:
+    try:
+        print(f"✓ Config cargada — DB: {DATABASE_URL.split('@')[-1].split('/')[0] if '@' in DATABASE_URL else 'OK'}")
+    except Exception:
+        print("✓ Config cargada")
