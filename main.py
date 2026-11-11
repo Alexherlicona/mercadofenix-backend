@@ -22,6 +22,7 @@ from routes.social import router as social_router, router_publico as social_publ
 from routes.descargas import router as descargas_router
 from routes.reportes import router as reportes_router
 from routes.google_auth import router as google_router
+from routes.google_vendedor_auth import router as google_vendedor_router
 import cloudinary
 from routes.notificaciones import router as notificaciones_router
 cloudinary.config(
@@ -79,6 +80,7 @@ app.include_router(social_router)
 app.include_router(social_publico_router, prefix="/api")
 app.include_router(descargas_router)
 app.include_router(google_router, prefix="/api")
+app.include_router(google_vendedor_router, prefix="/api")
 app.include_router(notificaciones_router)
 @app.get("/")
 async def root():
