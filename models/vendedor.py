@@ -12,7 +12,9 @@ class Vendedor(Base):
     propietario    = Column(String(100), nullable=False)
     nombre_tienda  = Column(String(100), nullable=False)
     telefono       = Column(String(8),   unique=True, index=True, nullable=False)
-    email          = Column(String(120), unique=True, index=True, nullable=True)  # ← NUEVO
+    email          = Column(String(120), unique=True, index=True, nullable=True)
+    google_id      = Column(String(64),  unique=True, index=True, nullable=True)
+    oauth_provider = Column(String(20),  nullable=True)  # ← NUEVO
     departamento   = Column(String(50),  nullable=False)
     municipio      = Column(String(50),  nullable=False)
     direccion_exacta = Column(Text,      nullable=False)
